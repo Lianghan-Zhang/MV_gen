@@ -63,3 +63,6 @@ tempdocs
 .agent
 .agents
 .claude
+
+# dataintel
+dataintel_client
