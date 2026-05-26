@@ -1,0 +1,3 @@
+# Batch-local materialized view generation
+
+The ETL MV Agent Prototype will not perform one-shot global materialized view candidate generation before batching. Instead, materialized views are generated within each ComplexityBatch, starting from an empty Materialized View State in Batch-1; each batch can rewrite with historical views, add newly materialized views to the global state, and then perform final rewrite with the expanded state. This keeps MV planning aligned with structural complexity order and avoids committing the prototype to an upfront global search strategy before the batch-wise reuse loop has been validated.
