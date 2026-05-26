@@ -54,6 +54,7 @@ conda-meta/
 *.tmp
 *.swp
 *.swo
+llm_demo/artifacts/
 
 # temp docs
 tempdocs

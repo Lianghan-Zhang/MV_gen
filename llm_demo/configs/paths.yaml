@@ -1,0 +1,3 @@
+paths:
+  workflow_sql_dir: tpcds-spark
+  artifact_root: llm_demo/artifacts

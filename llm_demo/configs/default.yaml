@@ -1,0 +1,7 @@
+execution:
+  mode: dry_run
+
+llm:
+  provider: deepseek
+  temperature_env: LLM_TEMPERATURE
+  max_retries_env: LLM_MAX_RETRIES

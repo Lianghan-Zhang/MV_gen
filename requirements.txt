@@ -1,0 +1,6 @@
+pytest
+pydantic
+openai
+python-dotenv
+PyYAML
+nbformat
