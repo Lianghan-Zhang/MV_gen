@@ -25,7 +25,7 @@
       "family_key": "store_sales-date_dim-item",
       "tables": ["date_dim", "store_sales", "item"],
       "predicates": ["item.i_manager_id = 1", "date_dim.d_moy = 11", "date_dim.d_year = 2000"],
-      "group_by_exprs": ["dt.d_year", "item.i_category_id"],
+      "group_by_exprs": ["date_dim.d_year", "item.i_category_id"],
       "aggregate_exprs": ["sum(ss_ext_sales_price)"]
     },
     {
@@ -33,7 +33,7 @@
       "family_key": "store_sales-date_dim-item",
       "tables": ["date_dim", "store_sales", "item"],
       "predicates": ["item.i_manager_id = 1", "date_dim.d_moy = 11", "date_dim.d_year = 2000"],
-      "group_by_exprs": ["dt.d_year", "item.i_brand_id"],
+      "group_by_exprs": ["date_dim.d_year", "item.i_brand_id"],
       "aggregate_exprs": ["sum(ss_ext_sales_price)"]
     }
   ]
@@ -55,7 +55,7 @@
         "store_sales.ss_item_sk = item.i_item_sk"
       ],
       "common_predicates": ["item.i_manager_id = 1", "date_dim.d_moy = 11", "date_dim.d_year = 2000"],
-      "union_group_by_exprs": ["dt.d_year", "item.i_category_id", "item.i_brand_id"],
+      "union_group_by_exprs": ["date_dim.d_year", "item.i_category_id", "item.i_brand_id"],
       "union_measure_exprs": ["sum(ss_ext_sales_price)"]
     }
   ]

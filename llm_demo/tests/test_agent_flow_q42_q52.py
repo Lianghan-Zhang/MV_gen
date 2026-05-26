@@ -60,6 +60,8 @@ def test_live_feature_family_and_self_iteration_agents_produce_artifacts() -> No
         block = outer_blocks[0]
         assert {"date_dim", "store_sales", "item"}.issubset(set(block["tables"]))
         assert block["complexity_type"] == "join_filter_groupby"
+        serialized_block = json.dumps(block, ensure_ascii=False)
+        assert "dt." not in serialized_block
 
     families_path = FamilyAgent(store, llm_client).run(query_blocks_path)
     families = store.read_json(families_path)["query_families"]
@@ -75,6 +77,73 @@ def test_live_feature_family_and_self_iteration_agents_produce_artifacts() -> No
             for evidence in suggestion["evidence_refs"]:
                 if evidence.get("artifact") and "run_log.jsonl" in evidence["artifact"]:
                     assert evidence.get("event_id")
+
+
+def test_feature_agent_normalizes_aliases_to_physical_table_names() -> None:
+    class EvaluatingLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def infer(self, prompt: str, load_json: bool = True) -> dict:
+            self.calls += 1
+            if self.calls == 2:
+                return {
+                    "query_blocks": [
+                        {
+                            "qb_id": "q42.outer",
+                            "query_id": "q42",
+                            "scope_type": "outer",
+                            "tables": ["date_dim", "store_sales", "item"],
+                            "join_edges": [
+                                "date_dim.d_date_sk = store_sales.ss_sold_date_sk",
+                                "store_sales.ss_item_sk = item.i_item_sk",
+                            ],
+                            "predicates": ["date_dim.d_moy = 11", "date_dim.d_year = 2000", "item.i_manager_id = 1"],
+                            "group_by_exprs": ["date_dim.d_year", "item.i_category_id"],
+                            "aggregate_exprs": ["sum(ss_ext_sales_price)"],
+                            "complexity_type": "join_filter_groupby",
+                            "family_key": "store_sales-date_dim-item",
+                            "unsupported_reasons": [],
+                        }
+                    ],
+                    "query_to_qbs": {"q42": ["q42.outer"]},
+                    "qb_to_query": {"q42.outer": "q42"},
+                }
+            return {
+                "query_blocks": [
+                    {
+                        "qb_id": "q42.outer",
+                        "query_id": "q42",
+                        "scope_type": "outer",
+                        "tables": ["dt", "store_sales", "item"],
+                        "join_edges": [
+                            "dt.d_date_sk = store_sales.ss_sold_date_sk",
+                            "store_sales.ss_item_sk = item.i_item_sk",
+                        ],
+                        "predicates": ["dt.d_moy = 11", "dt.d_year = 2000", "item.i_manager_id = 1"],
+                        "group_by_exprs": ["dt.d_year", "item.i_category_id"],
+                        "aggregate_exprs": ["sum(ss_ext_sales_price)"],
+                        "complexity_type": "join_filter_groupby",
+                        "family_key": "store_sales-dt-item",
+                        "unsupported_reasons": [],
+                    }
+                ],
+                "query_to_qbs": {"q42": ["q42.outer"]},
+                "qb_to_query": {"q42.outer": "q42"},
+            }
+
+    store = make_store("test_feature_aliases")
+    raw_sql_dir = SQLLoaderAgent(store).run([PROJECT_ROOT / "tpcds-spark" / "q42.sql"])
+    llm = EvaluatingLLM()
+    query_blocks_path = FeatureAgent(store, llm).run(raw_sql_dir)
+    block = store.read_json(query_blocks_path)["query_blocks"][0]
+
+    assert llm.calls == 2
+    assert block["tables"] == ["date_dim", "store_sales", "item"]
+    assert block["family_key"] == "store_sales-date_dim-item"
+    serialized_block = json.dumps(block, ensure_ascii=False)
+    assert "dt." not in serialized_block
+    assert "date_dim.d_year" in serialized_block
 
 
 def test_notebook_skeleton_documents_first_flow() -> None:

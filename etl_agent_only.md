@@ -1,6 +1,6 @@
 # ETL MV Agent-Only 原型实现方案
 
-> 版本：v1.27  
+> 版本：v1.30  
 > 日期：2026-05-26  
 > 目标：在 `llm_demo/` 中先用轻量 Agent 串通 ETL MV 编排流程。除 `SQLLoaderAgent` 和 `ExecutorAgent` 外，其余 Agent 均采用 `LLM + rules` 实现。第一版优先验证流程闭环，后续再逐步替换为确定性算法实现。
 
@@ -483,7 +483,10 @@ historical MV rewrite
 2. 每个 SQL 至少提取一个 outer QueryBlock。
 3. CTE / subquery 可以提取为独立 QueryBlock。
 4. 必须输出 `query_id`、`qb_id`、tables、join_edges、predicates、group_by、aggregate、complexity_type。
-5. 不确定时标记 `unsupported_reasons`，不要编造字段。
+5. `tables`、`join_edges`、`predicates`、`group_by_exprs`、`aggregate_exprs` 和 `family_key` 中的表名必须使用物理表名，不使用 SQL alias；例如 `date_dim dt` 的 `dt.d_year` 应输出为 `date_dim.d_year`。
+6. FeatureAgent 在 LLM 提取后增加 LLM + rules evaluate 环节，输入为原始 SQL 与 `candidate_feature_output`，输出仍为修正后的完整 FeatureOutput。
+7. evaluate 阶段检查输出中是否仍有 SQL alias 或未知表名前缀；SQL alias 应修正为物理表名，未知表名前缀写入 `unsupported_reasons`，不做复杂代码兜底。
+8. 不确定时标记 `unsupported_reasons`，不要编造字段。
 
 输出 JSON：
 
@@ -497,7 +500,7 @@ historical MV rewrite
       "tables": ["date_dim", "store_sales", "item"],
       "join_edges": [],
       "predicates": [],
-      "group_by_exprs": [],
+      "group_by_exprs": ["date_dim.d_year", "item.i_category_id"],
       "aggregate_exprs": [],
       "complexity_type": "join_filter_groupby",
       "family_key": "store_sales-date_dim-item",

@@ -23,10 +23,19 @@ class FeatureAgent(LLMRulesAgent):
         if not queries:
             raise ValueError(f"No SQL files found in {raw_dir}")
 
-        output = self._infer_structured(
+        extracted_output = self._infer_structured(
             task="从输入 SQL Text 中提取 QueryBlock，并输出 query_to_qbs 与 qb_to_query 索引。",
             context={"run_id": self.store.run_id, "expected_query_ids": [query["query_id"] for query in queries]},
             input_artifacts={"queries": queries},
+            output_model=FeatureOutput,
+        )
+        output = self._infer_structured(
+            task=(
+                "对 candidate_feature_output 进行 evaluate：检查 QueryBlock 是否使用物理表名而非 SQL alias，"
+                "检查 query_id/qb_id 索引是否一致；如发现 alias 或不合规字段，直接返回修正后的 FeatureOutput。"
+            ),
+            context={"run_id": self.store.run_id, "expected_query_ids": [query["query_id"] for query in queries]},
+            input_artifacts={"queries": queries, "candidate_feature_output": extracted_output},
             output_model=FeatureOutput,
         )
         self._validate_expected_queries(output, [query["query_id"] for query in queries])
