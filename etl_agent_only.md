@@ -1,7 +1,7 @@
 # ETL MV Agent-Only 原型实现方案
 
-> 版本：v1.30  
-> 日期：2026-05-26  
+> 版本：v1.41  
+> 日期：2026-05-27  
 > 目标：在 `llm_demo/` 中先用轻量 Agent 串通 ETL MV 编排流程。除 `SQLLoaderAgent` 和 `ExecutorAgent` 外，其余 Agent 均采用 `LLM + rules` 实现。第一版优先验证流程闭环，后续再逐步替换为确定性算法实现。
 
 ## 0. 定位
@@ -24,7 +24,7 @@ SQLLoaderAgent(code)
 
 核心约束：
 
-1. `SQLLoaderAgent` 使用代码实现，负责 SQL 文件读取和 raw artifact 落盘。
+1. `SQLLoaderAgent` 使用代码实现，负责 SQL 文件读取校验和 SQL manifest artifact 落盘，不复制原始 SQL 文件。
 2. `ExecutorAgent` 使用代码实现，负责 dry-run / Spark 执行、MV 状态维护和日志落盘。
 3. 其他 Agent 均使用 `LLM + rules` 实现。
 4. `rules` 是类似 skill 的 Markdown 规则文件，由 LLM 在运行时读取。
@@ -51,6 +51,20 @@ SQLLoaderAgent(code)
 25. RewriteAgent 只有在能够说明 rewritten SQL 与 original SQL 语义等价时才允许使用 MV；否则必须 fallback 到与 original SQL 等价的 SQL Text，并记录 `fallback_reason`。
 26. 每个 MV Candidate 必须包含 `source_query_ids`，表示候选来自当前 batch 的哪些 Query。
 27. MV Candidate 的 `target_queries` 只记录当前 batch 内可被该 Candidate 服务或覆盖的 Query；下游 batch 只能作为物化决策参考写入 `reason`，不能成为结构化 target。
+28. `BatchClusterAgent` 先在 `QueryFamily` 内分析 QueryBlock 复杂度，再把不同 family 的同复杂度 SQL 汇总到全局 `ComplexityBatch`。
+29. batch 的执行单位始终是完整 SQL/query_id；QueryBlock 只作为 family 归属、复杂度判断、MV 生成和 rewrite 辅助结构。
+30. 一个 SQL 的全局 batch 由其所有 QueryBlock 中最高复杂度决定。
+31. 如果一个 SQL 的多个 QueryBlock 属于不同 family，该 `query_id` 可以出现在同一 global batch 的多个 `family_groups` 中，但顶层 `query_ids` 必须去重，最终执行和 final rewrite 只能发生一次。
+32. `BatchMVAgent` 不允许跨 family 合并生成一个 MV Candidate；如果两个结构确实可共享 MV，应先由 `FamilyAgent` 的 evaluate 阶段合并或修正 QueryFamily。
+33. `FamilyAgent` 的 family 合并采用 predicate 兼容标准：join skeleton 相同或可证明等价、过滤列结构同构但常量值不同的 QueryBlock 可以进入同一 family。
+34. `QueryFamily.common_predicates` 只记录 family 内完全相同的谓词；同构过滤列但常量值不同的谓词用 `predicate_shapes` 表达。
+35. `BatchMVAgent` 默认构造 shared upstream superset MV：MV 不要求是某条 workflow SQL 的子集，而是使多个 workflow SQL 能通过 filter / projection / aggregate / roll-up 从 MV 重写得到。
+36. `BatchMVAgent` 先判断 shared upstream superset MV 的语义边界，再决定物理形态；若可证明聚合后仍支持所有 target Query，优先生成 fine-grain aggregate MV，否则 fallback 到 detail superset MV，仍无法安全 rewrite 时 skip。
+37. superset MV 只把 target Query 共同拥有的 predicate shape 放入 MV predicate，并且泛化范围只能来自当前 batch 已出现的常量集合；非共同 predicate 不进入 MV predicate，而是记录为下游 residual filter。
+38. RewriteAgent 永远不覆盖 original SQL；每个 rewrite 阶段、每条 SQL 都必须输出 `{query_id}_rewritten.sql`、对应 `{query_id}_rewrite_meta.json`，并追加 run log。
+39. 即使没有安全可用的 MV，RewriteAgent 也必须生成 original-equivalent 的 rewritten SQL，后续阶段统一从 rewritten SQL 产物读取。
+40. `BatchMVAgent` 采用两次 LLM + rules 调用：第一次生成 `candidate_mv_output`，第二次 evaluate 并修正为最终 MV Candidate 输出。
+41. `BatchMVAgent` 的 evaluate 阶段不新增核心数据结构；它只校验并修正 MV Candidate 是否满足当前 batch、family 边界、shared upstream superset、依赖 DAG 和 rewrite 安全约束。
 
 ## 1. 工作目录
 
@@ -139,16 +153,16 @@ LLM_MAX_RETRIES=2
 
 | Agent | 实现方式 | 说明 |
 |---|---|---|
-| `SQLLoaderAgent` | 代码 | 读取 SQL 文件、生成 `query_id`、保存 raw SQL artifact |
+| `SQLLoaderAgent` | 代码 | 读取 SQL 文件、生成 `query_id`、保存 SQL manifest artifact |
 | `FeatureAgent` | LLM + rules | 从 SQL 中提取 QueryBlock JSON |
 | `FamilyAgent` | LLM + rules | 基于 QueryBlock 聚合 QueryFamily |
-| `BatchClusterAgent` | LLM + rules | 以 SQL/query_id 为单位生成 ComplexityBatch |
+| `BatchClusterAgent` | LLM + rules | 基于 QueryBlock 和 QueryFamily 生成 SQL 级 ComplexityBatch，并在 batch 内保留 family_groups |
 | `BatchMVAgent` | LLM + rules | 在 batch 内生成、选择 MV candidate，并输出 CTAS SQL |
 | `RewriteAgent` | LLM + rules | 基于全局已物化 MV 生成 rewritten SQL |
 | `ExecutorAgent` | 代码 | 通过 `materialize_mvs(...)` 物化 MV，通过 `run_queries(...)` 执行或模拟执行 SQL，并维护 `materialized_mvs` |
 | `SelfIterationAgent` | LLM + rules | 基于日志生成规则优化建议 |
 
-第一版 `FamilyAgent` 和 `BatchClusterAgent` 串行调用。它们的数据依赖都来自 `FeatureAgent` 的 QueryBlock 输出，理论上可以并行，但当前不需要为了性能增加异步编排复杂度。
+第一版 `FamilyAgent` 和 `BatchClusterAgent` 串行调用：先由 `FamilyAgent` 生成 QueryFamily，再由 `BatchClusterAgent` 读取 QueryBlock、`query_to_qbs` 和 QueryFamily 生成全局 ComplexityBatch。这样让 family 参与复杂度分层判断，但不引入额外的 FamilyBatch 数据结构。
 
 ## 4. 最小框架设计
 
@@ -189,7 +203,7 @@ run_log
 第一版建议的最小 artifact 契约：
 
 ```text
-{run_id}/00_raw_sql/{query_id}.sql
+{run_id}/00_raw_sql/sql_manifest.json
 {run_id}/01_query_blocks/query_blocks.json
 {run_id}/01_query_blocks/query_to_qbs.json
 {run_id}/01_query_blocks/qb_to_query.json
@@ -198,8 +212,10 @@ run_log
 {run_id}/04_batch_mvs/batch_{batch_id}_mv_candidates.json
 {run_id}/04_batch_mvs/batch_{batch_id}_mv_build.sql
 {run_id}/04_batch_mvs/materialized_mvs.json
-{run_id}/05_rewritten_sql/batch_{batch_id}/historical_rewrite/{query_id}.sql
-{run_id}/05_rewritten_sql/batch_{batch_id}/final_rewrite/{query_id}.sql
+{run_id}/05_rewritten_sql/batch_{batch_id}/historical_rewrite/{query_id}_rewritten.sql
+{run_id}/05_rewritten_sql/batch_{batch_id}/historical_rewrite/{query_id}_rewrite_meta.json
+{run_id}/05_rewritten_sql/batch_{batch_id}/final_rewrite/{query_id}_rewritten.sql
+{run_id}/05_rewritten_sql/batch_{batch_id}/final_rewrite/{query_id}_rewrite_meta.json
 {run_id}/06_execution_logs/run_log.jsonl
 {run_id}/07_feedback/feedback_rules_{run_id}.json
 ```
@@ -294,12 +310,12 @@ output_artifact_path
 
 | Agent | 主要输入 | 主要输出 |
 |---|---|---|
-| `SQLLoaderAgent` | `sql_paths` | `{run_id}/00_raw_sql/{query_id}.sql` |
-| `FeatureAgent` | raw SQL 目录 | QueryBlock、`query_to_qbs`、`qb_to_query` |
+| `SQLLoaderAgent` | `sql_paths` | `{run_id}/00_raw_sql/sql_manifest.json` |
+| `FeatureAgent` | SQL manifest | QueryBlock、`query_to_qbs`、`qb_to_query` |
 | `FamilyAgent` | QueryBlock artifact | QueryFamily artifact |
-| `BatchClusterAgent` | QueryBlock、`query_to_qbs` | ComplexityBatch artifact |
+| `BatchClusterAgent` | QueryBlock、`query_to_qbs`、QueryFamily | ComplexityBatch artifact |
 | `RewriteAgent` | original batch SQL、QueryBlock、`materialized_mvs.json` | historical rewrite 或 final rewrite SQL |
-| `BatchMVAgent` | historical rewrite SQL、原始 QueryBlock、原始 QueryFamily、`materialized_mvs.json`、全局 `complexity_batches.json` 和 `query_families.json` 只读上下文 | 当前 batch 的 MV Candidate JSON、MV build SQL |
+| `BatchMVAgent` | historical rewrite SQL、原始 QueryBlock、原始 QueryFamily、当前 batch 的 `family_groups`、`materialized_mvs.json`、全局 `complexity_batches.json` 和 `query_families.json` 只读上下文 | 当前 batch 的 MV Candidate JSON、MV build SQL |
 | `ExecutorAgent.materialize_mvs(...)` | MV Candidate JSON、MV build SQL | 成功物化的 MV 追加到 `materialized_mvs.json`；skip / failed Candidate 写入 run log |
 | `ExecutorAgent.run_queries(...)` | final rewrite SQL | run log |
 | `SelfIterationAgent` | `run_log.jsonl` | `{run_id}/07_feedback/feedback_rules_{run_id}.json` |
@@ -382,14 +398,16 @@ output_artifact_path
 5. `rewrite_agent.md` 说明何时使用 MV、何时 fallback。
 6. `self_iteration_agent.md` 说明如何基于日志输出规则建议。
 
-各 Agent 的“示例”小节建议包含：
+各 Agent 的“示例”小节建议包含，并随设计确认持续更新：
 
 1. `feature_agent.md`：给出 q42/q52 片段到 QueryBlock JSON 的示例。
-2. `family_agent.md`：给出两个同 join skeleton 的 QB 如何合并成 QueryFamily。
-3. `batch_cluster_agent.md`：给出 SQL 级复杂度取最高 QB complexity 的示例。
-4. `batch_mv_agent.md`：给出同 family、不同 group by 如何生成 fine-grain MV。
-5. `rewrite_agent.md`：给出可 rewrite 和必须 fallback 的对照示例。
+2. `family_agent.md`：给出 predicate 兼容、`predicate_shapes`、重复 family evaluate / merge 的示例。
+3. `batch_cluster_agent.md`：给出 SQL 级复杂度取最高 QB complexity，以及 global batch 内 `family_groups` 的示例。
+4. `batch_mv_agent.md`：给出 ETL superset MV、`mv_predicates`、`residual_filters`、`generalized_predicates` 的示例。
+5. `rewrite_agent.md`：给出基于 superset MV 加 residual filter / roll-up 的 rewrite 示例，以及必须 fallback 的对照示例。
 6. `self_iteration_agent.md`：给出 run log 到 rule suggestion 的反馈示例。
+
+实现文档只保留这些示例的摘要；真正注入 prompt 的示例必须写在对应 `rules/{agent_name}.md` 中，避免 `_prompt_template.md` 或方案文档变成超长规则库。
 
 ## 6. 运行主线
 
@@ -398,10 +416,10 @@ output_artifact_path
 执行前只做 workflow 顺序编排，不生成全局 MV candidate。
 
 ```text
-raw_sql_dir = SQLLoaderAgent(code).run(sql_paths)
-query_block_paths = FeatureAgent(llm+rules).run(raw_sql_dir)
+sql_manifest_path = SQLLoaderAgent(code).run(sql_paths)
+query_block_paths = FeatureAgent(llm+rules).run(sql_manifest_path)
 family_path = FamilyAgent(llm+rules).run(query_block_paths)
-batch_path = BatchClusterAgent(llm+rules).run(query_block_paths)
+batch_path = BatchClusterAgent(llm+rules).run(query_block_paths, family_path)
 ```
 
 ComplexityBatch 的执行顺序固定为从低复杂度到高复杂度：
@@ -413,11 +431,18 @@ Batch-3 = join_filter_groupby
 Batch-4 = other
 ```
 
+`BatchClusterAgent` 的判定过程分两层：
+
+1. 在每个 QueryFamily 内，根据成员 QueryBlock 的复杂度为所属 SQL 标注候选 batch。
+2. 把不同 family 中同一复杂度层级的 SQL 合并到全局 batch 中。
+
+因此，最终执行顺序仍是全局 `Batch-1 -> Batch-2 -> Batch-3 -> Batch-4`，不是按 family 分别执行。`ComplexityBatch` 内部用 `family_groups` 保存 batch 内的 family 组织关系，供 `BatchMVAgent` 生成 MV Candidate 使用。
+
 输出：
 
 | Artifact | 说明 |
 |---|---|
-| `artifacts/{run_id}/00_raw_sql/*.sql` | 原始 SQL |
+| `artifacts/{run_id}/00_raw_sql/sql_manifest.json` | 原始 SQL 文件 manifest，记录 query_id、原始路径、相对路径和大小，不复制 SQL Text |
 | `artifacts/{run_id}/01_query_blocks/query_blocks.json` | LLM 提取的 QueryBlock |
 | `artifacts/{run_id}/01_query_blocks/query_to_qbs.json` | SQL 到 QB 索引 |
 | `artifacts/{run_id}/01_query_blocks/qb_to_query.json` | QB 到 SQL 索引 |
@@ -431,25 +456,32 @@ Batch-4 = other
 ```text
 for batch in complexity_batches:
   1. RewriteAgent 使用 historical materialized_mvs.json 改写当前 batch 的 original SQL，生成 historical rewrite SQL
-     即使没有可用历史 MV，也必须输出与 original SQL 等价的 SQL，并记录 used_mv_ids = [] 和 fallback_reason
-  2. BatchMVAgent 基于 historical rewrite SQL Text + 原始 QueryBlock / 原始 QueryFamily 生成当前 batch 的 MV Candidate 和 build SQL；
+     每条 SQL 都必须输出 {query_id}_rewritten.sql 与 {query_id}_rewrite_meta.json
+     即使没有可用历史 MV，也必须输出与 original SQL 等价的 rewritten SQL，并记录 used_mv_ids = [] 和 fallback_reason
+  2. BatchMVAgent 分两次 LLM + rules 调用处理当前 batch：
+     2.1 基于 historical rewrite SQL Text + 原始 QueryBlock / 原始 QueryFamily / 当前 batch family_groups 生成 candidate_mv_output
+     2.2 基于相同输入 + candidate_mv_output 执行 evaluate，修正当前 batch 边界、family 边界、mv_type、predicate / residual_filter、depends_on_mv_ids、build_sql 和 decision
      可只读参考完整的 query_families.json 与 complexity_batches.json 判断后续复用价值
      如果 build SQL 依赖历史 MV，必须记录 depends_on_mv_ids
      即使 used_mv_ids = []，也应继续尝试生成当前 batch 的 MV Candidate
+     对外落盘的 batch_{batch_id}_mv_candidates.json 使用 evaluate 后的最终结果
   3. ExecutorAgent.materialize_mvs(...) 物化 decision = materialize 的 MV Candidate；成功则更新 materialized_mvs.json，失败只写 run_log.jsonl
   4. RewriteAgent 使用更新后的 materialized_mvs.json 重新改写当前 batch 的 original SQL，生成 final rewrite SQL；
-     若无法证明语义等价，final rewrite 也必须 fallback 到与 original SQL 等价的 SQL
+     每条 SQL 都必须输出 {query_id}_rewritten.sql 与 {query_id}_rewrite_meta.json
+     若无法证明语义等价，final rewrite 也必须 fallback 到与 original SQL 等价的 rewritten SQL
   5. ExecutorAgent.run_queries(...) 执行或 dry-run final rewrite SQL
 ```
 
 对应 Artifact 写入：
 
 ```text
-historical rewrite SQL -> {run_id}/05_rewritten_sql/batch_{batch_id}/historical_rewrite/{query_id}.sql
+historical rewrite SQL -> {run_id}/05_rewritten_sql/batch_{batch_id}/historical_rewrite/{query_id}_rewritten.sql
+historical rewrite meta -> {run_id}/05_rewritten_sql/batch_{batch_id}/historical_rewrite/{query_id}_rewrite_meta.json
 MV Candidate          -> {run_id}/04_batch_mvs/batch_{batch_id}_mv_candidates.json
 MV build SQL          -> {run_id}/04_batch_mvs/batch_{batch_id}_mv_build.sql
 Materialized View State -> {run_id}/04_batch_mvs/materialized_mvs.json
-final rewrite SQL     -> {run_id}/05_rewritten_sql/batch_{batch_id}/final_rewrite/{query_id}.sql
+final rewrite SQL     -> {run_id}/05_rewritten_sql/batch_{batch_id}/final_rewrite/{query_id}_rewritten.sql
+final rewrite meta    -> {run_id}/05_rewritten_sql/batch_{batch_id}/final_rewrite/{query_id}_rewrite_meta.json
 run log               -> {run_id}/06_execution_logs/run_log.jsonl
 ```
 
@@ -528,8 +560,17 @@ historical MV rewrite
 
 1. 聚合单位是 `qb_id`。
 2. 第一版优先 exact family，不做激进模糊合并。
-3. family 中记录 common tables、common join skeleton、common predicates、group by 分叉和 measure 并集。
+3. family 中记录 common tables、common join skeleton、common predicates、predicate shapes、group by 分叉和 measure 并集。
 4. 如果合并依据不足，保持分离。
+5. `FamilyAgent` 采用两次 LLM 调用：第一次生成 `candidate_query_families`，第二次 evaluate 并修正输出。
+6. evaluate 阶段输入为 QueryBlock 列表和 `candidate_query_families`，输出仍是修正后的完整 QueryFamily。
+7. evaluate 阶段重点检查是否存在重复 family、可合并 family、family_key 与 join skeleton 不一致、成员 QueryBlock 归属错误、common 字段错误等问题。
+8. family 合并采用 predicate 兼容标准，而不是要求 predicate 完全相同。
+9. 如果两个 family 的 QueryBlock 具有相同或可证明等价的 join skeleton、同构过滤列结构但常量值不同、兼容 measure，并且后续可共享 MV，应在 evaluate 阶段合并为同一个 family。
+10. `common_predicates` 只记录 family 内完全相同的完整谓词，例如所有成员都有 `item.i_manager_id = 1`。
+11. `predicate_shapes` 记录同构过滤列但常量值可能不同的谓词形状，例如 `date_dim.d_year = <CONST>`、`date_dim.d_moy = <CONST>`。
+12. `predicate_shapes` 中的字段名必须使用物理表名，不使用 SQL alias。
+13. 如果过滤列集合差异过大、predicate 语义不清或 family 是否可合并无法证明，保持分离，并在后续 SelfIterationAgent 的反馈中记录规则改进建议，而不是在 BatchMVAgent 中跨 family 生成 MV。
 
 输出 JSON：
 
@@ -541,9 +582,24 @@ historical MV rewrite
       "family_key": "store_sales-date_dim-item",
       "members": ["q42.outer", "q52.outer"],
       "common_tables": ["store_sales", "date_dim", "item"],
-      "common_predicates": ["i_manager_id = 1", "d_moy = 11", "d_year = 2000"],
-      "union_group_by_exprs": ["d_year", "i_category_id", "i_category", "i_brand_id", "i_brand"],
-      "union_measure_exprs": ["sum(ss_ext_sales_price)"]
+      "common_predicates": [
+        "item.i_manager_id = 1",
+        "date_dim.d_moy = 11",
+        "date_dim.d_year = 2000"
+      ],
+      "predicate_shapes": [
+        "date_dim.d_year = <CONST>",
+        "date_dim.d_moy = <CONST>",
+        "item.i_manager_id = <CONST>"
+      ],
+      "union_group_by_exprs": [
+        "date_dim.d_year",
+        "item.i_category_id",
+        "item.i_category",
+        "item.i_brand_id",
+        "item.i_brand"
+      ],
+      "union_measure_exprs": ["sum(store_sales.ss_ext_sales_price)"]
     }
   ]
 }
@@ -554,7 +610,7 @@ historical MV rewrite
 职责：
 
 ```text
-给定 QueryBlock 和 query_to_qbs，以 SQL/query_id 为单位生成 ComplexityBatch。
+给定 QueryBlock、query_to_qbs 和 QueryFamily，以 SQL/query_id 为单位生成全局 ComplexityBatch，并在每个 batch 内保留 family_groups。
 ```
 
 规则重点：
@@ -563,6 +619,14 @@ historical MV rewrite
 2. 一个 SQL 的复杂度取其所有 QueryBlock 的最高复杂度。
 3. batch 映射固定为 `join -> Batch-1`、`join_filter -> Batch-2`、`join_filter_groupby -> Batch-3`、`other -> Batch-4`。
 4. 当前不处理并发上限、子 batch 拆分。
+5. 先在每个 QueryFamily 内进行复杂度分层，再把同一复杂度层级的 SQL 合并到对应的 global batch。
+6. 不输出独立的 `FamilyBatch` artifact；family 内部分层结果只体现在 `ComplexityBatch.family_groups` 中。
+7. 顶层 `query_ids` 表示该 global batch 要处理的完整 SQL，必须去重。
+8. 如果一个 SQL 的多个 QueryBlock 属于不同 family，该 `query_id` 可以出现在多个 `family_groups` 中；这是 MV 生成视角的重复，不代表该 SQL 会被执行多次。
+9. 每个 `family_groups[].qb_ids` 只能包含该 family 的 QueryBlock；`family_groups[].query_ids` 必须由这些 QB 对应的 query_id 去重得到。
+10. `BatchClusterAgent` 采用两次 LLM 调用：第一次生成 `candidate_complexity_batches`，第二次 evaluate 并修正输出。
+11. evaluate 阶段输入为 QueryBlock、`query_to_qbs`、QueryFamily 和 `candidate_complexity_batches`，输出仍是修正后的完整 ComplexityBatch。
+12. evaluate 阶段重点检查：每个 SQL 是否按最高 QueryBlock 复杂度进入唯一 global batch、顶层 `query_ids` 是否去重、`family_groups` 是否只作为 batch 内组织信息、是否遗漏或误分 QueryBlock。
 
 输出 JSON：
 
@@ -572,12 +636,20 @@ historical MV rewrite
     {
       "batch_id": 1,
       "batch_type": "join",
-      "query_ids": []
+      "query_ids": [],
+      "family_groups": []
     },
     {
       "batch_id": 3,
       "batch_type": "join_filter_groupby",
-      "query_ids": ["q42", "q52"]
+      "query_ids": ["q42", "q52"],
+      "family_groups": [
+        {
+          "family_id": "family_ss_dd_item",
+          "query_ids": ["q42", "q52"],
+          "qb_ids": ["q42.outer", "q52.outer"]
+        }
+      ]
     }
   ]
 }
@@ -588,7 +660,14 @@ historical MV rewrite
 职责：
 
 ```text
-给定当前 batch 的 historical rewrite SQL Text、原始 QueryBlock、原始 QueryFamily、全局 materialized_mvs，以及完整的 complexity_batches / QueryFamily 只读上下文，生成当前 batch 的 MV spec 和 CTAS SQL。
+给定当前 batch 的 historical rewrite SQL Text、原始 QueryBlock、原始 QueryFamily、当前 batch 的 `family_groups`、全局 materialized_mvs，以及完整的 complexity_batches / QueryFamily 只读上下文，生成当前 batch 的 MV spec 和 CTAS SQL。
+```
+
+实现方式：
+
+```text
+第一次 LLM 调用：生成 candidate_mv_output。
+第二次 LLM 调用：evaluate candidate_mv_output，检查并修正是否满足 batch-local generation、family 边界、shared upstream superset MV、依赖 DAG 和 rewrite 安全约束，最终输出修正后的完整 MV Candidate JSON 与 build SQL。
 ```
 
 规则重点：
@@ -608,7 +687,7 @@ historical MV rewrite
 13. 如果 build SQL 引用了历史 MV，必须在 `depends_on_mv_ids` 中记录直接依赖的 MV；如果不依赖历史 MV，则使用空数组。
 14. `depends_on_mv_ids` 只能引用 `materialized_mvs.json` 中已存在且 `available_from_batch <= current_batch_id` 的 MV。
 15. 一个 MV Candidate 可以依赖多个历史 MV，但依赖关系必须保持 DAG，不能依赖自身或形成循环。
-16. 优先生成 filtered fine-grain aggregate MV。
+16. 默认先构造 shared upstream superset MV，而不是先在 detail MV 和 aggregate MV 中二选一。
 17. 只生成能够从当前 batch Query / QueryFamily 得到结构依据的 MV。
 18. 后续 batch / 全局 QueryFamily 只读上下文只能影响 `decision` 和 `reason`，不能成为结构化 target，也不能生成 downstream-only Candidate。
 19. 输出必须包含 source query、target query、group by、measure、output columns、decision、reason 和 depends_on_mv_ids。
@@ -618,6 +697,26 @@ historical MV rewrite
 23. 每个 MV Candidate 必须给出 `decision`，取值为 `materialize` 或 `skip`。
 24. `decision = materialize` 的 MV Candidate 必须包含可执行的 `build_sql`、`mv_id` 和 `target_table_name`；物化成功后才允许将 `mv_id` 写入 `materialized_mvs.json`。
 25. `decision = skip` 可以不包含 `build_sql` 和 `mv_id`，但仍需保留 `candidate_id`、`source_batch_id`、`source_query_ids`、`family_id`、`target_queries`、`decision` 和 `reason`，用于后续反馈分析。
+26. 当前 batch 内优先按 `family_groups` 生成 MV Candidate；如果一个 SQL 出现在多个 family group 中，只能分别针对对应 family 的 QueryBlock 生成候选，不代表 SQL 被拆分执行。
+27. 每个 MV Candidate 只能绑定一个 `family_id`，不允许把不同 family 的 QueryBlock 直接合并为一个 Candidate。
+28. 如果 BatchMVAgent 发现不同 family 可能共享 MV，只能在 `reason` 或 run log 中记录 family 质量问题，不能跨 family 生成 MV；该问题应由 FamilyAgent evaluate 或 SelfIterationAgent 反馈规则处理。
+29. 默认采用 ETL shared upstream superset MV 策略：MV 是当前 batch 多个 Query 的可复用上游中间结果，目标 Query 通过 residual filter / projection / aggregate / roll-up 从 MV 中重写得到。
+30. MV 不要求是某条 workflow SQL 的子集；更准确的关系是 `workflow_sql_i = rewrite(MV, residual_filter_i, projection_i, rollup_i)`。
+31. `BatchMVAgent` 先确定 shared upstream superset MV 的语义边界，再决定物理形态。
+32. 如果所有 target Query 都是聚合查询，measure 可 roll-up，且 group-by 粒度能覆盖所有 target Query 的 roll-up 维度与 residual filter 列，优先生成 `mv_type = "fine_grain_aggregate"`。
+33. 如果无法安全聚合，或者下游需要明细字段 / 非可加聚合 / 复杂表达式，则 fallback 生成 `mv_type = "detail_superset"`。
+34. 如果 detail superset MV 也无法证明能安全支持 target Query rewrite，则 Candidate 必须 `decision = skip`。
+35. 只有所有 `target_queries` 共同拥有的 predicate shape 才能进入共享 MV predicate。
+36. 共同 predicate shape 可以做当前 batch 内有限泛化，例如当前 batch 已出现 `date_dim.d_year = 2000` 和 `date_dim.d_year = 2001` 时，可以生成 `date_dim.d_year IN (2000, 2001)`。
+37. 非共同 predicate shape 不进入共享 MV predicate，必须按 query 记录到 `residual_filters`，由下游 rewrite 或执行 SQL 继续过滤。
+38. MV 必须保留执行 `residual_filters`、projection 和 roll-up 所需的列或 group-by 粒度；如果无法保留，Candidate 必须 `decision = skip`。
+39. 不允许为了覆盖未来 batch 直接去掉共同 predicate，或生成覆盖整列范围的宽 MV。
+40. 如果共享 MV 使用了有限泛化 predicate，必须在 Candidate 中记录 `generalized_predicates`，说明每个 predicate shape 覆盖的当前 batch 常量范围。
+41. 额外拆分更窄的专用 MV 可以作为后续 cost-based 扩展；第一版的默认主规则是 shared upstream superset MV，而不是为每个 predicate 差异都生成多个 Candidate。
+42. `BatchMVAgent` 必须采用 generate + evaluate 两阶段；第一阶段生成 `candidate_mv_output`，第二阶段输入相同上下文和 `candidate_mv_output`，输出修正后的完整结果。
+43. evaluate 阶段必须检查：`source_batch_id` 是否等于当前 batch，`source_query_ids` / `target_queries` 是否都属于当前 batch，`family_id` 是否唯一且不跨 family，`mv_type` 是否与可证明 rewrite 关系一致，`mv_predicates` / `generalized_predicates` / `residual_filters` 是否满足 shared upstream superset 规则，`output_columns` / `group_by_exprs` / `measure_exprs` 是否保留 residual filter、projection 和 roll-up 所需信息，`depends_on_mv_ids` 是否只引用可见历史 MV 且不形成循环，`build_sql` 是否与 Candidate spec 对齐。
+44. evaluate 阶段如果发现 Candidate 只由未来 batch 或 downstream reuse 触发，必须删除或改为 `decision = "skip"`；如果发现 Candidate 跨 family，必须拆回单 family Candidate，或记录 family 质量问题并 skip。
+45. 对外落盘的 `batch_{batch_id}_mv_candidates.json` 使用 evaluate 后的最终结果；第一阶段草稿可作为 debug artifact 保留，但不作为 ExecutorAgent 的输入。
 
 输出 JSON：
 
@@ -629,13 +728,59 @@ historical MV rewrite
       "candidate_id": "cand_batch_2_family_ss_dd_item_0001",
       "mv_id": "mv_ss_dd_item_mgr1_y2000_m11_fg",
       "source_batch_id": 2,
-      "source_query_ids": ["q42"],
+      "source_query_ids": ["q42", "q52"],
       "family_id": "family_ss_dd_item",
+      "mv_type": "fine_grain_aggregate",
       "target_table_name": "mv_ss_dd_item_mgr1_y2000_m11_fg",
       "target_queries": ["q42", "q52"],
       "depends_on_mv_ids": ["mv_batch_1_example"],
-      "group_by_exprs": ["d_year", "d_moy", "i_manager_id", "i_brand_id", "i_brand", "i_category_id", "i_category"],
-      "measure_exprs": ["SUM(ss_ext_sales_price) AS sum_ext_sales_price"],
+      "mv_predicates": [
+        "item.i_manager_id = 1",
+        "date_dim.d_moy = 11",
+        "date_dim.d_year IN (2000)"
+      ],
+      "generalized_predicates": [
+        {
+          "predicate_shape": "date_dim.d_year = <CONST>",
+          "covered_values": [2000],
+          "source_query_ids": ["q42", "q52"]
+        },
+        {
+          "predicate_shape": "date_dim.d_moy = <CONST>",
+          "covered_values": [11],
+          "source_query_ids": ["q42", "q52"]
+        }
+      ],
+      "residual_filters": [
+        {
+          "query_id": "q42",
+          "predicates": []
+        },
+        {
+          "query_id": "q52",
+          "predicates": []
+        }
+      ],
+      "output_columns": [
+        "date_dim.d_year",
+        "date_dim.d_moy",
+        "item.i_manager_id",
+        "item.i_brand_id",
+        "item.i_brand",
+        "item.i_category_id",
+        "item.i_category",
+        "sum_ext_sales_price"
+      ],
+      "group_by_exprs": [
+        "date_dim.d_year",
+        "date_dim.d_moy",
+        "item.i_manager_id",
+        "item.i_brand_id",
+        "item.i_brand",
+        "item.i_category_id",
+        "item.i_category"
+      ],
+      "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price"],
       "build_sql": "CREATE OR REPLACE TABLE ...",
       "decision": "materialize",
       "reason": "same family and same filter, different group by branches"
@@ -649,26 +794,29 @@ historical MV rewrite
 职责：
 
 ```text
-给定 SQL、QueryBlock 和全局 materialized_mvs，输出 rewritten SQL 或 fallback。
+给定 original SQL、QueryBlock 和全局 materialized_mvs，输出每条 SQL 的 rewritten SQL 文件、rewrite meta 和 run log。
 ```
 
 规则重点：
 
 1. historical rewrite 和 final rewrite 的输入 SQL 都应是当前 batch 的 original SQL。
 2. historical rewrite 只能使用进入当前 batch 前已经存在的 Materialized View State。
-3. historical rewrite 必须产出 SQL 文件；如果没有可用历史 MV，则输出与 original SQL 等价的 SQL Text，`used_mv_ids = []`，`fallback_reason = "no_available_historical_mv"`。
-4. final rewrite 使用当前 batch 物化成功后更新的完整 Materialized View State。
-5. 只能使用 `materialized_mvs.json` 中且 `available_from_batch <= current_batch_id` 的 Materialized View。
-6. rewritten SQL 必须保持 original SQL 输出语义。
-7. 只有当 MV 的 join key、filter 覆盖关系、group by 粒度、aggregate 表达式和 output columns 都能覆盖原 SQL 需求时，才允许 rewrite。
-8. 如果不确定是否等价，必须 fallback 到与 original SQL 等价的 SQL Text，不能为了使用 MV 进行猜测式改写。
-9. fallback 时 `status = "fallback"`，`used_mv_ids = []`，`fallback_reason` 必须非空。
-10. 成功使用 MV 时 `status = "rewritten"`，`used_mv_ids` 必须非空，`fallback_reason = null`。
-11. historical rewrite 没有可用历史 MV 时，`fallback_reason = "no_available_historical_mv"`。
-12. final rewrite 没有可安全使用 MV 时，也必须 fallback original，并按原因填写 `fallback_reason`。
-13. 常见 fallback reason 包括：`no_available_historical_mv`、`no_matching_mv`、`mv_columns_not_covering_query`、`filter_not_implied_by_mv`、`group_by_not_compatible`、`aggregate_not_supported`、`unsupported_sql_pattern`、`semantic_equivalence_uncertain`。
-14. 第一版支持 SUM / COUNT / AVG / MIN / MAX。
-15. 对复杂 window、rollup、count distinct、stddev、相关子查询默认 fallback。
+3. RewriteAgent 永远不覆盖 original SQL。
+4. 每个 rewrite 阶段、每条输入 SQL 都必须产出 `{query_id}_rewritten.sql`。
+5. 每个 rewrite 阶段、每条输入 SQL 都必须产出 `{query_id}_rewrite_meta.json`。
+6. 每个 rewrite 阶段都必须向 `run_log.jsonl` 追加事件，记录输入、输出、rewrite 状态、使用 MV 和 fallback 原因。
+7. historical rewrite 如果没有可用历史 MV，则输出与 original SQL 等价的 rewritten SQL，`used_mv_ids = []`，`fallback_reason = "no_available_historical_mv"`。
+8. final rewrite 使用当前 batch 物化成功后更新的完整 Materialized View State。
+9. 只能使用 `materialized_mvs.json` 中且 `available_from_batch <= current_batch_id` 的 Materialized View。
+10. rewritten SQL 必须保持 original SQL 输出语义。
+11. 只有当 MV 的 join key、filter 覆盖关系、group by 粒度、aggregate 表达式和 output columns 都能覆盖原 SQL 需求时，才允许 rewrite。
+12. 如果不确定是否等价，必须 fallback 到与 original SQL 等价的 rewritten SQL，不能为了使用 MV 进行猜测式改写。
+13. fallback 时 `status = "fallback"`，`used_mv_ids = []`，`fallback_reason` 必须非空。
+14. 成功使用 MV 时 `status = "rewritten"`，`used_mv_ids` 必须非空，`fallback_reason = null`。
+15. final rewrite 没有可安全使用 MV 时，也必须 fallback original-equivalent SQL，并按原因填写 `fallback_reason`。
+16. 常见 fallback reason 包括：`no_available_historical_mv`、`no_matching_mv`、`mv_columns_not_covering_query`、`filter_not_implied_by_mv`、`group_by_not_compatible`、`aggregate_not_supported`、`unsupported_sql_pattern`、`semantic_equivalence_uncertain`。
+17. 第一版支持 SUM / COUNT / AVG / MIN / MAX。
+18. 对复杂 window、rollup、count distinct、stddev、相关子查询默认 fallback。
 
 输出 JSON：
 
@@ -677,16 +825,36 @@ historical MV rewrite
   "rewrites": [
     {
       "query_id": "q42",
+      "rewrite_stage": "final",
       "status": "rewritten",
       "used_mv_ids": ["mv_ss_dd_item_mgr1_y2000_m11_fg"],
-      "rewritten_sql": "SELECT ... FROM mv_ss_dd_item_mgr1_y2000_m11_fg ...",
+      "original_sql_path": ".../tpcds-spark/q42.sql",
+      "rewritten_sql_path": "{run_id}/05_rewritten_sql/batch_3/final_rewrite/q42_rewritten.sql",
+      "rewrite_meta_path": "{run_id}/05_rewritten_sql/batch_3/final_rewrite/q42_rewrite_meta.json",
+      "rewrite_mode": "mv_filter_projection_rollup",
+      "residual_filters": [],
+      "rollup_exprs": ["GROUP BY date_dim.d_year, item.i_category_id, item.i_category"],
+      "semantic_check": {
+        "status": "pass",
+        "reason": "query can be derived from MV by projection and roll-up"
+      },
       "fallback_reason": null
     },
     {
       "query_id": "q99",
+      "rewrite_stage": "final",
       "status": "fallback",
       "used_mv_ids": [],
-      "rewritten_sql": "SELECT ... FROM original_tables ...",
+      "original_sql_path": ".../tpcds-spark/q99.sql",
+      "rewritten_sql_path": "{run_id}/05_rewritten_sql/batch_3/final_rewrite/q99_rewritten.sql",
+      "rewrite_meta_path": "{run_id}/05_rewritten_sql/batch_3/final_rewrite/q99_rewrite_meta.json",
+      "rewrite_mode": "original_equivalent",
+      "residual_filters": [],
+      "rollup_exprs": [],
+      "semantic_check": {
+        "status": "fallback",
+        "reason": "semantic equivalence uncertain"
+      },
       "fallback_reason": "semantic_equivalence_uncertain"
     }
   ]
@@ -821,7 +989,7 @@ llm_demo/workflow/tpcds-spark/q52.sql
 1. 验证 `SQLLoaderAgent` 能读取 SQL。
 2. 验证 `FeatureAgent` 能提取 `q42.outer` / `q52.outer`。
 3. 验证 `FamilyAgent` 能识别 `store_sales-date_dim-item` family。
-4. 验证 `BatchClusterAgent` 能把 q42/q52 作为 SQL 放入 `join_filter_groupby` batch。
+4. 验证 `BatchClusterAgent` 能把 q42/q52 作为 SQL 放入 `join_filter_groupby` global batch，并在该 batch 的 `family_groups` 中归入同一个 family。
 5. 验证 `BatchMVAgent` 能基于同 family 生成候选 MV。
 6. 验证 `RewriteAgent` 和 `ExecutorAgent` 能 dry-run 落盘 rewritten SQL 和日志。
 

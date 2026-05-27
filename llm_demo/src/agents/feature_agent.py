@@ -13,15 +13,12 @@ class FeatureAgent(LLMRulesAgent):
     def __init__(self, store: ArtifactStore, llm_client: LLMClient) -> None:
         super().__init__(store=store, llm_client=llm_client, agent_name="FeatureAgent")
 
-    def run(self, raw_sql_dir: str | Path) -> Path:
+    def run(self, raw_sql_artifact: str | Path) -> Path:
         started_at = time.monotonic()
-        raw_dir = Path(raw_sql_dir)
-        queries = [
-            {"query_id": path.stem, "sql_text": path.read_text(encoding="utf-8")}
-            for path in sorted(raw_dir.glob("*.sql"))
-        ]
+        raw_artifact = Path(raw_sql_artifact)
+        queries = self._load_queries(raw_artifact)
         if not queries:
-            raise ValueError(f"No SQL files found in {raw_dir}")
+            raise ValueError(f"No SQL files found from {raw_artifact}")
 
         extracted_output = self._infer_structured(
             task="从输入 SQL Text 中提取 QueryBlock，并输出 query_to_qbs 与 qb_to_query 索引。",
@@ -47,11 +44,39 @@ class FeatureAgent(LLMRulesAgent):
         self.store.append_run_log(
             agent_name=self.agent_name,
             event="success",
-            input_artifact_paths=[raw_dir],
+            input_artifact_paths=[raw_artifact],
             output_artifact_paths=[query_blocks_path, query_to_qbs_path, qb_to_query_path],
             elapsed_ms=self._elapsed_ms(started_at),
         )
         return query_blocks_path
+
+    def _load_queries(self, raw_artifact: Path) -> list[dict[str, str]]:
+        if raw_artifact.is_dir():
+            return [
+                {"query_id": path.stem, "sql_text": path.read_text(encoding="utf-8")}
+                for path in sorted(raw_artifact.glob("*.sql"))
+            ]
+
+        manifest = self.store.read_json(raw_artifact)
+        queries: list[dict[str, str]] = []
+        for item in manifest.get("queries", []):
+            query_id = item["query_id"]
+            sql_path = self._resolve_sql_path(item)
+            queries.append({"query_id": query_id, "sql_text": sql_path.read_text(encoding="utf-8")})
+        return queries
+
+    def _resolve_sql_path(self, manifest_item: dict) -> Path:
+        sql_path = Path(manifest_item["sql_path"])
+        if sql_path.is_file():
+            return sql_path
+
+        relative_path = manifest_item.get("sql_path_relative")
+        if relative_path:
+            project_relative_path = self.store.project_root / relative_path
+            if project_relative_path.is_file():
+                return project_relative_path
+
+        raise FileNotFoundError(f"SQL file not found for query_id={manifest_item.get('query_id')}: {sql_path}")
 
     def _validate_expected_queries(self, output: dict, expected_query_ids: list[str]) -> None:
         query_to_qbs = output.get("query_to_qbs", {})

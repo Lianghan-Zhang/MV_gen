@@ -28,25 +28,35 @@ def make_store(name: str) -> ArtifactStore:
     )
 
 
-def test_sql_loader_writes_raw_sql_and_run_log() -> None:
+def test_sql_loader_writes_manifest_and_run_log() -> None:
     store = make_store("test_sql_loader")
-    raw_sql_dir = SQLLoaderAgent(store).run(SQL_PATHS)
+    manifest_path = SQLLoaderAgent(store).run(SQL_PATHS)
 
-    assert (raw_sql_dir / "q42.sql").read_text(encoding="utf-8").startswith("SELECT")
-    assert (raw_sql_dir / "q52.sql").read_text(encoding="utf-8").startswith("SELECT")
+    assert manifest_path == store.path("00_raw_sql/sql_manifest.json")
+    assert not (store.path("00_raw_sql") / "q42.sql").exists()
+    assert not (store.path("00_raw_sql") / "q52.sql").exists()
+
+    manifest = store.read_json(manifest_path)
+    queries = {query["query_id"]: query for query in manifest["queries"]}
+    assert set(queries) == {"q42", "q52"}
+    assert queries["q42"]["sql_path"].endswith("tpcds-spark/q42.sql")
+    assert queries["q52"]["sql_path"].endswith("tpcds-spark/q52.sql")
+    assert queries["q42"]["size_bytes"] > 0
+    assert "sha256" not in queries["q42"]
 
     records = [json.loads(line) for line in store.run_log_path.read_text(encoding="utf-8").splitlines()]
     assert len(records) == 1
     assert records[0]["agent_name"] == "SQLLoaderAgent"
     assert records[0]["event_id"].startswith(f"{store.run_id}:SQLLoaderAgent:global:")
+    assert records[0]["output_artifact_paths"] == [str(manifest_path)]
 
 
 def test_live_feature_family_and_self_iteration_agents_produce_artifacts() -> None:
     store = make_store("test_live_agents")
     llm_client = LLMClient(project_root=PROJECT_ROOT)
 
-    raw_sql_dir = SQLLoaderAgent(store).run(SQL_PATHS)
-    query_blocks_path = FeatureAgent(store, llm_client).run(raw_sql_dir)
+    sql_manifest_path = SQLLoaderAgent(store).run(SQL_PATHS)
+    query_blocks_path = FeatureAgent(store, llm_client).run(sql_manifest_path)
     query_blocks = store.read_json(query_blocks_path)["query_blocks"]
 
     by_query = {}
@@ -133,9 +143,9 @@ def test_feature_agent_normalizes_aliases_to_physical_table_names() -> None:
             }
 
     store = make_store("test_feature_aliases")
-    raw_sql_dir = SQLLoaderAgent(store).run([PROJECT_ROOT / "tpcds-spark" / "q42.sql"])
+    sql_manifest_path = SQLLoaderAgent(store).run([PROJECT_ROOT / "tpcds-spark" / "q42.sql"])
     llm = EvaluatingLLM()
-    query_blocks_path = FeatureAgent(store, llm).run(raw_sql_dir)
+    query_blocks_path = FeatureAgent(store, llm).run(sql_manifest_path)
     block = store.read_json(query_blocks_path)["query_blocks"][0]
 
     assert llm.calls == 2

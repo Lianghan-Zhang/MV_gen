@@ -35,6 +35,7 @@ class QueryFamily(BaseModel):
     common_tables: list[str] = Field(default_factory=list)
     common_join_skeleton: list[Any] = Field(default_factory=list)
     common_predicates: list[str] = Field(default_factory=list)
+    predicate_shapes: list[str] = Field(default_factory=list)
     union_group_by_exprs: list[str] = Field(default_factory=list)
     union_measure_exprs: list[str] = Field(default_factory=list)
 
