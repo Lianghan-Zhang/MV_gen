@@ -15,6 +15,10 @@
 9. 每条 suggestion 必须包含非空 `evidence_refs`。
 10. 如果证据来自 `run_log.jsonl`，必须引用对应 `event_id`。
 11. `evidence_refs` 只做证据追踪，不引入新的主数据结构。
+12. 可以基于 BatchClusterAgent 的 batch 分配日志提出规则建议，例如 SQL 被误分 batch、family_groups 缺失或 query_ids 未去重。
+13. 可以基于 BatchMVAgent 的 MV Candidate 日志提出规则建议，例如 candidate 被 skip、candidate 跨 batch、candidate 跨 family、build_sql 与 spec 不一致、depends_on_mv_ids 不可用。
+14. 如果证据来自 BatchMVAgent 的单个 MV Candidate 事件，`evidence_refs` 必须包含对应 `candidate_id`。
+15. 如果证据来自 run log 的 `details` 字段，应在 `reason` 中简要说明使用了哪些 details，例如 `candidate_count`、`candidate_ids`、`decision` 或 `target_queries`。
 
 # 示例
 
@@ -51,6 +55,35 @@
               "artifact": "llm_demo/artifacts/20260526_153000/06_execution_logs/run_log.jsonl",
               "event_id": "20260526_153000:FeatureAgent:global:0002",
               "event": "failed"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+如果发现 BatchMVAgent 生成的候选被跳过，则输出：
+
+```json
+{
+  "run_id": "20260526_153000",
+  "agent_rule_suggestions": {
+    "BatchMVAgent": {
+      "suggestions": [
+        {
+          "target_rule": "shared_upstream_superset_mv",
+          "suggestion": "clarify",
+          "suggested_rule_text": "当 MV Candidate 因无法证明 residual filter / projection / roll-up 可安全支持目标 Query 而 skip 时，应在 reason 中明确指出缺失的列、group_by 粒度或 measure 兼容性问题。",
+          "reason": "BatchMVAgent 的 run log 显示 candidate 被 skip，需要更清晰的 skip 归因。",
+          "evidence_refs": [
+            {
+              "artifact": "llm_demo/artifacts/20260526_153000/06_execution_logs/run_log.jsonl",
+              "event_id": "20260526_153000:BatchMVAgent:batch_3:0006",
+              "batch_id": 3,
+              "candidate_id": "cand_batch_3_family_ss_dd_item_0001",
+              "event": "mv_candidate_skipped"
             }
           ]
         }

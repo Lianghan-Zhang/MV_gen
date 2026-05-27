@@ -63,6 +63,7 @@ class ArtifactStore:
         batch_id: int | None = None,
         candidate_id: str | None = None,
         error: str | None = None,
+        details: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.run_log_path.parent.mkdir(parents=True, exist_ok=True)
         scope = f"batch_{batch_id}" if batch_id is not None else "global"
@@ -78,6 +79,7 @@ class ArtifactStore:
             "elapsed_ms": elapsed_ms,
             "event": event,
             "error": error,
+            "details": details or {},
             "created_at_ms": int(time.time() * 1000),
         }
         with self.run_log_path.open("a", encoding="utf-8") as handle:

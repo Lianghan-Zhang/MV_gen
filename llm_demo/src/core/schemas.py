@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 
 
 ComplexityType = Literal["join", "join_filter", "join_filter_groupby", "other"]
+MVType = Literal["fine_grain_aggregate", "detail_superset"]
+MVDecision = Literal["materialize", "skip"]
 
 
 class QueryBlock(BaseModel):
@@ -42,6 +44,60 @@ class QueryFamily(BaseModel):
 
 class FamilyOutput(BaseModel):
     query_families: list[QueryFamily]
+
+
+class FamilyGroup(BaseModel):
+    family_id: str
+    query_ids: list[str] = Field(default_factory=list)
+    qb_ids: list[str] = Field(default_factory=list)
+
+
+class ComplexityBatch(BaseModel):
+    batch_id: int
+    batch_type: ComplexityType
+    query_ids: list[str] = Field(default_factory=list)
+    family_groups: list[FamilyGroup] = Field(default_factory=list)
+
+
+class BatchClusterOutput(BaseModel):
+    complexity_batches: list[ComplexityBatch]
+
+
+class GeneralizedPredicate(BaseModel):
+    predicate_shape: str
+    covered_values: list[Any] = Field(default_factory=list)
+    source_query_ids: list[str] = Field(default_factory=list)
+
+
+class ResidualFilter(BaseModel):
+    query_id: str
+    predicates: list[str] = Field(default_factory=list)
+
+
+class MVCandidate(BaseModel):
+    candidate_id: str
+    source_batch_id: int
+    source_query_ids: list[str]
+    family_id: str
+    target_queries: list[str]
+    decision: MVDecision
+    reason: str
+    mv_id: str | None = None
+    mv_type: MVType | None = None
+    target_table_name: str | None = None
+    depends_on_mv_ids: list[str] = Field(default_factory=list)
+    mv_predicates: list[str] = Field(default_factory=list)
+    generalized_predicates: list[GeneralizedPredicate] = Field(default_factory=list)
+    residual_filters: list[ResidualFilter] = Field(default_factory=list)
+    output_columns: list[str] = Field(default_factory=list)
+    group_by_exprs: list[str] = Field(default_factory=list)
+    measure_exprs: list[str] = Field(default_factory=list)
+    build_sql: str | None = None
+
+
+class BatchMVOutput(BaseModel):
+    batch_id: int
+    mv_candidates: list[MVCandidate] = Field(default_factory=list)
 
 
 class EvidenceRef(BaseModel):

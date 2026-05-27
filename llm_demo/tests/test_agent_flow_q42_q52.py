@@ -6,6 +6,8 @@ from pathlib import Path
 
 import nbformat
 
+from llm_demo.src.agents.batch_cluster_agent import BatchClusterAgent
+from llm_demo.src.agents.batch_mv_agent import BatchMVAgent
 from llm_demo.src.agents.family_agent import FamilyAgent
 from llm_demo.src.agents.feature_agent import FeatureAgent
 from llm_demo.src.agents.self_iteration_agent import SelfIterationAgent
@@ -26,6 +28,32 @@ def make_store(name: str) -> ArtifactStore:
         run_id=f"{name}_{int(time.time() * 1000)}",
         artifact_root=PROJECT_ROOT / "llm_demo" / "artifacts",
     )
+
+
+def write_original_equivalent_historical_rewrite(store: ArtifactStore, batch_id: int, query_ids: list[str]) -> Path:
+    rewrite_dir = store.ensure_dir(f"05_rewritten_sql/batch_{batch_id}/historical_rewrite")
+    for query_id in query_ids:
+        original_sql_path = PROJECT_ROOT / "tpcds-spark" / f"{query_id}.sql"
+        rewritten_sql_path = rewrite_dir / f"{query_id}_rewritten.sql"
+        rewritten_sql_path.write_text(original_sql_path.read_text(encoding="utf-8"), encoding="utf-8")
+        meta_path = rewrite_dir / f"{query_id}_rewrite_meta.json"
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "query_id": query_id,
+                    "rewrite_stage": "historical",
+                    "status": "fallback",
+                    "used_mv_ids": [],
+                    "fallback_reason": "no_available_historical_mv",
+                    "original_sql_path": str(original_sql_path),
+                    "rewritten_sql_path": str(rewritten_sql_path),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    return rewrite_dir
 
 
 def test_sql_loader_writes_manifest_and_run_log() -> None:
@@ -87,6 +115,62 @@ def test_live_feature_family_and_self_iteration_agents_produce_artifacts() -> No
             for evidence in suggestion["evidence_refs"]:
                 if evidence.get("artifact") and "run_log.jsonl" in evidence["artifact"]:
                     assert evidence.get("event_id")
+
+
+def test_live_batch_cluster_batch_mv_and_self_iteration_agents_produce_artifacts() -> None:
+    store = make_store("test_live_batch_agents")
+    llm_client = LLMClient(project_root=PROJECT_ROOT)
+
+    sql_manifest_path = SQLLoaderAgent(store).run(SQL_PATHS)
+    query_blocks_path = FeatureAgent(store, llm_client).run(sql_manifest_path)
+    families_path = FamilyAgent(store, llm_client).run(query_blocks_path)
+
+    batches_path = BatchClusterAgent(store, llm_client).run(query_blocks_path, families_path)
+    batches = store.read_json(batches_path)["complexity_batches"]
+    by_type = {batch["batch_type"]: batch for batch in batches}
+
+    target_batch = by_type["join_filter_groupby"]
+    assert target_batch["batch_id"] == 3
+    assert {"q42", "q52"}.issubset(set(target_batch["query_ids"]))
+    assert any(
+        {"q42", "q52"}.issubset(set(group["query_ids"]))
+        and {"q42.outer", "q52.outer"}.issubset(set(group["qb_ids"]))
+        for group in target_batch["family_groups"]
+    )
+
+    historical_rewrite_dir = write_original_equivalent_historical_rewrite(store, 3, ["q42", "q52"])
+    mv_candidates_path = BatchMVAgent(store, llm_client).run(
+        3,
+        batches_path,
+        query_blocks_path,
+        families_path,
+        historical_rewrite_dir,
+    )
+    mv_output = store.read_json(mv_candidates_path)
+    assert mv_output["batch_id"] == 3
+    assert mv_output["mv_candidates"]
+    assert store.path("04_batch_mvs/batch_3_mv_build.sql").exists()
+    assert store.path("04_batch_mvs/materialized_mvs.json").exists()
+
+    for candidate in mv_output["mv_candidates"]:
+        assert candidate["source_batch_id"] == 3
+        assert candidate["family_id"]
+        assert set(candidate["source_query_ids"]).issubset(set(target_batch["query_ids"]))
+        assert set(candidate["target_queries"]).issubset(set(target_batch["query_ids"]))
+        assert not any(query_id.startswith("downstream") for query_id in candidate["target_queries"])
+
+    records = [json.loads(line) for line in store.run_log_path.read_text(encoding="utf-8").splitlines()]
+    batch_mv_records = [record for record in records if record["agent_name"] == "BatchMVAgent"]
+    assert any(record["details"].get("candidate_ids") for record in batch_mv_records)
+    assert any(record.get("candidate_id") for record in batch_mv_records)
+
+    feedback_path = SelfIterationAgent(store, llm_client).run(store.run_log_path)
+    feedback = store.read_json(feedback_path)
+    assert feedback["run_id"] == store.run_id
+    assert isinstance(feedback["agent_rule_suggestions"], dict)
+    for group in feedback["agent_rule_suggestions"].values():
+        for suggestion in group.get("suggestions", []):
+            assert suggestion["evidence_refs"]
 
 
 def test_feature_agent_normalizes_aliases_to_physical_table_names() -> None:
@@ -166,4 +250,6 @@ def test_notebook_skeleton_documents_first_flow() -> None:
     assert "SQLLoaderAgent" in source
     assert "FeatureAgent" in source
     assert "FamilyAgent" in source
+    assert "BatchClusterAgent" in source
+    assert "BatchMVAgent" in source
     assert "SelfIterationAgent" in source
