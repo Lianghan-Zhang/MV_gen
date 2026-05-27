@@ -19,6 +19,9 @@
 13. 可以基于 BatchMVAgent 的 MV Candidate 日志提出规则建议，例如 candidate 被 skip、candidate 跨 batch、candidate 跨 family、build_sql 与 spec 不一致、depends_on_mv_ids 不可用。
 14. 如果证据来自 BatchMVAgent 的单个 MV Candidate 事件，`evidence_refs` 必须包含对应 `candidate_id`。
 15. 如果证据来自 run log 的 `details` 字段，应在 `reason` 中简要说明使用了哪些 details，例如 `candidate_count`、`candidate_ids`、`decision` 或 `target_queries`。
+16. 可以基于 RewriteAgent 的 fallback 日志提出规则建议，例如 fallback_reason 过于笼统、可用 MV 未被使用、rewrite_stage 混淆或 used_mv_ids 不合法。
+17. 可以基于 ExecutorAgent 的 dry-run 日志提出规则建议，例如 MV 依赖缺失导致物化失败、execution order 缺少 run_query step、query 顺序与 ComplexityBatch 不一致。
+18. 如果证据来自 execution order artifact，应在 `evidence_refs.artifact` 中指向 `batch_{batch_id}_execution_order.json`，并在 `reason` 中说明相关 step。
 
 # 示例
 
@@ -84,6 +87,35 @@
               "batch_id": 3,
               "candidate_id": "cand_batch_3_family_ss_dd_item_0001",
               "event": "mv_candidate_skipped"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+如果发现 RewriteAgent 大量 fallback，则输出：
+
+```json
+{
+  "run_id": "20260526_153000",
+  "agent_rule_suggestions": {
+    "RewriteAgent": {
+      "suggestions": [
+        {
+          "target_rule": "rewrite_fallback_reason",
+          "suggestion": "clarify",
+          "suggested_rule_text": "当 RewriteAgent fallback 时，fallback_reason 应优先指出具体失败原因，例如 mv_columns_not_covering_query、group_by_not_compatible 或 semantic_equivalence_uncertain，避免只写 no_matching_mv。",
+          "reason": "RewriteAgent 的 run log 显示 final rewrite fallback，需要更细粒度失败归因。",
+          "evidence_refs": [
+            {
+              "artifact": "llm_demo/artifacts/20260526_153000/06_execution_logs/run_log.jsonl",
+              "event_id": "20260526_153000:RewriteAgent:batch_3:0008",
+              "batch_id": 3,
+              "query_ids": ["q42"],
+              "event": "rewrite_fallback"
             }
           ]
         }

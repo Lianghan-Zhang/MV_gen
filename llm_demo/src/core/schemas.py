@@ -8,6 +8,10 @@ from pydantic import BaseModel, Field
 ComplexityType = Literal["join", "join_filter", "join_filter_groupby", "other"]
 MVType = Literal["fine_grain_aggregate", "detail_superset"]
 MVDecision = Literal["materialize", "skip"]
+RewriteStage = Literal["historical", "final"]
+RewriteStatus = Literal["rewritten", "fallback"]
+ExecutionStepType = Literal["materialize_mv", "run_query"]
+ExecutionStatus = Literal["success", "failed", "skipped", "planned"]
 
 
 class QueryBlock(BaseModel):
@@ -98,6 +102,51 @@ class MVCandidate(BaseModel):
 class BatchMVOutput(BaseModel):
     batch_id: int
     mv_candidates: list[MVCandidate] = Field(default_factory=list)
+
+
+class SemanticCheck(BaseModel):
+    status: str
+    reason: str
+
+
+class RewriteRecord(BaseModel):
+    query_id: str
+    rewrite_stage: RewriteStage
+    status: RewriteStatus
+    used_mv_ids: list[str] = Field(default_factory=list)
+    original_sql_path: str
+    rewritten_sql_path: str
+    rewrite_meta_path: str
+    rewrite_mode: str
+    rewritten_sql: str
+    residual_filters: list[Any] = Field(default_factory=list)
+    rollup_exprs: list[Any] = Field(default_factory=list)
+    semantic_check: SemanticCheck
+    fallback_reason: str | None = None
+
+
+class RewriteOutput(BaseModel):
+    rewrites: list[RewriteRecord]
+
+
+class ExecutionStep(BaseModel):
+    step_order: int
+    step_type: ExecutionStepType
+    status: ExecutionStatus
+    query_id: str | None = None
+    candidate_id: str | None = None
+    mv_id: str | None = None
+    sql_path: str | None = None
+    meta_path: str | None = None
+    reason: str | None = None
+    depends_on_mv_ids: list[str] = Field(default_factory=list)
+
+
+class ExecutionOrder(BaseModel):
+    run_id: str
+    batch_id: int
+    mode: str = "dry_run"
+    steps: list[ExecutionStep] = Field(default_factory=list)
 
 
 class EvidenceRef(BaseModel):
