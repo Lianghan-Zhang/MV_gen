@@ -1,7 +1,7 @@
 # ETL MV Agent-Only 原型实现方案
 
-> 版本：v1.41  
-> 日期：2026-05-27  
+> 版本：v1.43  
+> 日期：2026-05-28  
 > 目标：在 `llm_demo/` 中先用轻量 Agent 串通 ETL MV 编排流程。除 `SQLLoaderAgent` 和 `ExecutorAgent` 外，其余 Agent 均采用 `LLM + rules` 实现。第一版优先验证流程闭环，后续再逐步替换为确定性算法实现。
 
 ## 0. 定位
@@ -65,6 +65,12 @@ SQLLoaderAgent(code)
 39. 即使没有安全可用的 MV，RewriteAgent 也必须生成 original-equivalent 的 rewritten SQL，后续阶段统一从 rewritten SQL 产物读取。
 40. `BatchMVAgent` 采用两次 LLM + rules 调用：第一次生成 `candidate_mv_output`，第二次 evaluate 并修正为最终 MV Candidate 输出。
 41. `BatchMVAgent` 的 evaluate 阶段不新增核心数据结构；它只校验并修正 MV Candidate 是否满足当前 batch、family 边界、shared upstream superset、依赖 DAG 和 rewrite 安全约束。
+42. `BatchMVAgent` 输出的 `output_columns` 必须是 MV 表的真实物理列名，不能写 `date_dim.d_year` 这类源表限定列名。
+43. 源字段身份通过 MV Candidate / Materialized View State 内的 `column_mappings` 保存，例如 `date_dim.d_year -> date_dim_d_year`；这是 MV 元数据字段，不是新的独立核心业务结构。
+44. `build_sql` 必须显式为每个输出表达式设置稳定别名，例如 `date_dim.d_year AS date_dim_d_year`、`item.i_brand_id AS item_i_brand_id`。
+45. `tpcds_simple.json` 只作为物理表字段白名单，用于校验 `source_table.source_column` 是否存在；不生成新的 artifact，不做 SQL 自动修复。
+46. RewriteAgent 使用 MV 时只能引用 MV 物理列名；如果 rewritten SQL 仍引用源表限定列名，或丢失 original SQL 的输出列名，必须 fallback。
+47. `ExecutorAgent.run_queries(...)` 输出的 execution order 中，`run_query.depends_on_mv_ids` 必须来自对应 rewrite meta 的 `used_mv_ids`。
 
 ## 1. 工作目录
 
@@ -93,12 +99,14 @@ llm_demo/
 │   ├── batch_cluster_agent.md
 │   ├── batch_mv_agent.md
 │   ├── rewrite_agent.md
+│   ├── executor_agent.md
 │   └── self_iteration_agent.md
 ├── src/
 │   ├── core/
 │   │   ├── agent_base.py
 │   │   ├── llm_client.py
 │   │   ├── artifact_store.py
+│   │   ├── physical_schema.py
 │   │   └── schemas.py
 │   └── agents/
 │       ├── sql_loader_agent.py
@@ -216,6 +224,7 @@ run_log
 {run_id}/05_rewritten_sql/batch_{batch_id}/historical_rewrite/{query_id}_rewrite_meta.json
 {run_id}/05_rewritten_sql/batch_{batch_id}/final_rewrite/{query_id}_rewritten.sql
 {run_id}/05_rewritten_sql/batch_{batch_id}/final_rewrite/{query_id}_rewrite_meta.json
+{run_id}/06_execution_logs/batch_{batch_id}_execution_order.json
 {run_id}/06_execution_logs/run_log.jsonl
 {run_id}/07_feedback/feedback_rules_{run_id}.json
 ```
@@ -244,15 +253,51 @@ run_log
       "family_id": "family_ss_dd_item",
       "target_queries": ["q42", "q52"],
       "depends_on_mv_ids": ["mv_batch_1_example"],
-      "group_by_exprs": ["d_year", "d_moy", "i_manager_id"],
-      "measure_exprs": ["SUM(ss_ext_sales_price) AS sum_ext_sales_price"],
+      "group_by_exprs": ["date_dim.d_year", "date_dim.d_moy", "item.i_manager_id"],
+      "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price"],
+      "output_columns": [
+        "date_dim_d_year",
+        "date_dim_d_moy",
+        "item_i_manager_id",
+        "sum_ext_sales_price"
+      ],
+      "column_mappings": [
+        {
+          "source_expr": "date_dim.d_year",
+          "source_table": "date_dim",
+          "source_column": "d_year",
+          "mv_column": "date_dim_d_year",
+          "role": "dimension"
+        },
+        {
+          "source_expr": "date_dim.d_moy",
+          "source_table": "date_dim",
+          "source_column": "d_moy",
+          "mv_column": "date_dim_d_moy",
+          "role": "filter"
+        },
+        {
+          "source_expr": "item.i_manager_id",
+          "source_table": "item",
+          "source_column": "i_manager_id",
+          "mv_column": "item_i_manager_id",
+          "role": "filter"
+        },
+        {
+          "source_expr": "SUM(store_sales.ss_ext_sales_price)",
+          "source_table": "store_sales",
+          "source_column": "ss_ext_sales_price",
+          "mv_column": "sum_ext_sales_price",
+          "role": "measure"
+        }
+      ],
       "build_sql_path": "{run_id}/04_batch_mvs/batch_2_mv_build.sql"
     }
   ]
 }
 ```
 
-该文件不保存 `status = failed`、`decision = skip` 或未执行的 MV Candidate。成功物化的 MV 可以保留 `source_candidate_id`，用于回溯其来源候选。RewriteAgent 只读取这个文件判断可用 Materialized View。
+该文件不保存 `status = failed`、`decision = skip` 或未执行的 MV Candidate。成功物化的 MV 可以保留 `source_candidate_id`，用于回溯其来源候选。RewriteAgent 读取这个文件判断可用 Materialized View，并使用其中的 `output_columns` / `column_mappings.mv_column` 作为可引用的 MV 物理列集合。
 
 `run_log.jsonl` 的单行最小结构：
 
@@ -317,7 +362,7 @@ output_artifact_path
 | `RewriteAgent` | original batch SQL、QueryBlock、`materialized_mvs.json` | historical rewrite 或 final rewrite SQL |
 | `BatchMVAgent` | historical rewrite SQL、原始 QueryBlock、原始 QueryFamily、当前 batch 的 `family_groups`、`materialized_mvs.json`、全局 `complexity_batches.json` 和 `query_families.json` 只读上下文 | 当前 batch 的 MV Candidate JSON、MV build SQL |
 | `ExecutorAgent.materialize_mvs(...)` | MV Candidate JSON、MV build SQL | 成功物化的 MV 追加到 `materialized_mvs.json`；skip / failed Candidate 写入 run log |
-| `ExecutorAgent.run_queries(...)` | final rewrite SQL | run log |
+| `ExecutorAgent.run_queries(...)` | final rewrite SQL、rewrite meta、ComplexityBatch | dry-run execution order JSON、run log |
 | `SelfIterationAgent` | `run_log.jsonl` | `{run_id}/07_feedback/feedback_rules_{run_id}.json` |
 
 ## 5. 通用 LLM + Rules Prompt 模板
@@ -351,6 +396,8 @@ output_artifact_path
 10. 已物化成功的 MV 对后续 batch 全局可用。
 11. 可以只读参考完整的 `complexity_batches.json` 和 `query_families.json` 来判断当前 batch MV 的后续复用价值，但不能为未来 batch 生成 MV Candidate。
 12. MV Candidate 必须有当前 batch 的 Query 或 QueryFamily 依据；下游信息只能影响 `decision` 和 `reason`，不能单独触发候选生成。
+13. MV 的 `output_columns` 是 MV 表真实物理列名；源字段身份必须写入 `column_mappings`，不要把 `date_dim.d_year` 作为 MV 输出列名。
+14. 使用 MV rewrite 时只能引用 MV 物理列名，并保持 original SQL 的输出列名；无 alias 表达式也要保留 Spark 输出名。
 
 # 当前上下文
 
@@ -405,7 +452,8 @@ output_artifact_path
 3. `batch_cluster_agent.md`：给出 SQL 级复杂度取最高 QB complexity，以及 global batch 内 `family_groups` 的示例。
 4. `batch_mv_agent.md`：给出 ETL superset MV、`mv_predicates`、`residual_filters`、`generalized_predicates` 的示例。
 5. `rewrite_agent.md`：给出基于 superset MV 加 residual filter / roll-up 的 rewrite 示例，以及必须 fallback 的对照示例。
-6. `self_iteration_agent.md`：给出 run log 到 rule suggestion 的反馈示例。
+6. `executor_agent.md`：说明 dry-run 物化状态维护、execution order 输出和 query 依赖记录。
+7. `self_iteration_agent.md`：给出 run log 到 rule suggestion 的反馈示例。
 
 实现文档只保留这些示例的摘要；真正注入 prompt 的示例必须写在对应 `rules/{agent_name}.md` 中，避免 `_prompt_template.md` 或方案文档变成超长规则库。
 
@@ -460,16 +508,18 @@ for batch in complexity_batches:
      即使没有可用历史 MV，也必须输出与 original SQL 等价的 rewritten SQL，并记录 used_mv_ids = [] 和 fallback_reason
   2. BatchMVAgent 分两次 LLM + rules 调用处理当前 batch：
      2.1 基于 historical rewrite SQL Text + 原始 QueryBlock / 原始 QueryFamily / 当前 batch family_groups 生成 candidate_mv_output
-     2.2 基于相同输入 + candidate_mv_output 执行 evaluate，修正当前 batch 边界、family 边界、mv_type、predicate / residual_filter、depends_on_mv_ids、build_sql 和 decision
+     2.2 基于相同输入 + candidate_mv_output 执行 evaluate，修正当前 batch 边界、family 边界、mv_type、predicate / residual_filter、depends_on_mv_ids、column_mappings、build_sql 和 decision
      可只读参考完整的 query_families.json 与 complexity_batches.json 判断后续复用价值
      如果 build SQL 依赖历史 MV，必须记录 depends_on_mv_ids
+     如果 decision = materialize，output_columns 必须是 MV 物理列名，build SQL 必须显式 AS mv_column
+     使用 tpcds_simple.json 校验 column_mappings 中的 source_table.source_column 是否存在
      即使 used_mv_ids = []，也应继续尝试生成当前 batch 的 MV Candidate
      对外落盘的 batch_{batch_id}_mv_candidates.json 使用 evaluate 后的最终结果
   3. ExecutorAgent.materialize_mvs(...) 物化 decision = materialize 的 MV Candidate；成功则更新 materialized_mvs.json，失败只写 run_log.jsonl
   4. RewriteAgent 使用更新后的 materialized_mvs.json 重新改写当前 batch 的 original SQL，生成 final rewrite SQL；
      每条 SQL 都必须输出 {query_id}_rewritten.sql 与 {query_id}_rewrite_meta.json
      若无法证明语义等价，final rewrite 也必须 fallback 到与 original SQL 等价的 rewritten SQL
-  5. ExecutorAgent.run_queries(...) 执行或 dry-run final rewrite SQL
+  5. ExecutorAgent.run_queries(...) 执行或 dry-run final rewrite SQL，并根据 rewrite meta 的 used_mv_ids 写出 execution order 中的 query 依赖
 ```
 
 对应 Artifact 写入：
@@ -482,6 +532,7 @@ MV build SQL          -> {run_id}/04_batch_mvs/batch_{batch_id}_mv_build.sql
 Materialized View State -> {run_id}/04_batch_mvs/materialized_mvs.json
 final rewrite SQL     -> {run_id}/05_rewritten_sql/batch_{batch_id}/final_rewrite/{query_id}_rewritten.sql
 final rewrite meta    -> {run_id}/05_rewritten_sql/batch_{batch_id}/final_rewrite/{query_id}_rewrite_meta.json
+execution order       -> {run_id}/06_execution_logs/batch_{batch_id}_execution_order.json
 run log               -> {run_id}/06_execution_logs/run_log.jsonl
 ```
 
@@ -690,12 +741,12 @@ historical MV rewrite
 16. 默认先构造 shared upstream superset MV，而不是先在 detail MV 和 aggregate MV 中二选一。
 17. 只生成能够从当前 batch Query / QueryFamily 得到结构依据的 MV。
 18. 后续 batch / 全局 QueryFamily 只读上下文只能影响 `decision` 和 `reason`，不能成为结构化 target，也不能生成 downstream-only Candidate。
-19. 输出必须包含 source query、target query、group by、measure、output columns、decision、reason 和 depends_on_mv_ids。
+19. 输出必须包含 source query、target query、group by、measure、output columns、column mappings、decision、reason 和 depends_on_mv_ids。
 20. 每个 MV Candidate 必须给出稳定的 `candidate_id`，同一 `run_id` 内唯一。
 21. 每个 MV Candidate 必须给出非空 `source_query_ids`，其中所有 Query 都必须属于当前 `source_batch_id`。
 22. 每个 MV Candidate 必须给出非空 `target_queries`，其中所有 Query 都必须属于当前 `source_batch_id`。
 23. 每个 MV Candidate 必须给出 `decision`，取值为 `materialize` 或 `skip`。
-24. `decision = materialize` 的 MV Candidate 必须包含可执行的 `build_sql`、`mv_id` 和 `target_table_name`；物化成功后才允许将 `mv_id` 写入 `materialized_mvs.json`。
+24. `decision = materialize` 的 MV Candidate 必须包含可执行的 `build_sql`、`mv_id`、`target_table_name` 和非空 `column_mappings`；物化成功后才允许将 `mv_id` 写入 `materialized_mvs.json`。
 25. `decision = skip` 可以不包含 `build_sql` 和 `mv_id`，但仍需保留 `candidate_id`、`source_batch_id`、`source_query_ids`、`family_id`、`target_queries`、`decision` 和 `reason`，用于后续反馈分析。
 26. 当前 batch 内优先按 `family_groups` 生成 MV Candidate；如果一个 SQL 出现在多个 family group 中，只能分别针对对应 family 的 QueryBlock 生成候选，不代表 SQL 被拆分执行。
 27. 每个 MV Candidate 只能绑定一个 `family_id`，不允许把不同 family 的 QueryBlock 直接合并为一个 Candidate。
@@ -714,9 +765,14 @@ historical MV rewrite
 40. 如果共享 MV 使用了有限泛化 predicate，必须在 Candidate 中记录 `generalized_predicates`，说明每个 predicate shape 覆盖的当前 batch 常量范围。
 41. 额外拆分更窄的专用 MV 可以作为后续 cost-based 扩展；第一版的默认主规则是 shared upstream superset MV，而不是为每个 predicate 差异都生成多个 Candidate。
 42. `BatchMVAgent` 必须采用 generate + evaluate 两阶段；第一阶段生成 `candidate_mv_output`，第二阶段输入相同上下文和 `candidate_mv_output`，输出修正后的完整结果。
-43. evaluate 阶段必须检查：`source_batch_id` 是否等于当前 batch，`source_query_ids` / `target_queries` 是否都属于当前 batch，`family_id` 是否唯一且不跨 family，`mv_type` 是否与可证明 rewrite 关系一致，`mv_predicates` / `generalized_predicates` / `residual_filters` 是否满足 shared upstream superset 规则，`output_columns` / `group_by_exprs` / `measure_exprs` 是否保留 residual filter、projection 和 roll-up 所需信息，`depends_on_mv_ids` 是否只引用可见历史 MV 且不形成循环，`build_sql` 是否与 Candidate spec 对齐。
-44. evaluate 阶段如果发现 Candidate 只由未来 batch 或 downstream reuse 触发，必须删除或改为 `decision = "skip"`；如果发现 Candidate 跨 family，必须拆回单 family Candidate，或记录 family 质量问题并 skip。
-45. 对外落盘的 `batch_{batch_id}_mv_candidates.json` 使用 evaluate 后的最终结果；第一阶段草稿可作为 debug artifact 保留，但不作为 ExecutorAgent 的输入。
+43. `output_columns` 必须是 MV 表的真实物理列名，例如 `date_dim_d_year`、`item_i_brand_id`，不能写 `date_dim.d_year` 这类源表限定列名。
+44. `column_mappings` 记录源字段到 MV 物理列的映射，最小字段包括 `source_expr`、`source_table`、`source_column`、`mv_column` 和 `role`。
+45. 对直接来自物理表字段的 dimension / filter / projection 列，`mv_column` 使用 `{source_table}_{source_column}`；measure 列使用稳定聚合别名，例如 `sum_ext_sales_price`。
+46. `build_sql` 中每个输出表达式必须显式 `AS mv_column`，例如 `date_dim.d_year AS date_dim_d_year`。
+47. `column_mappings.source_table.source_column` 必须能在 `tpcds_simple.json` 中找到；代码层只校验，不自动修复 SQL。
+48. evaluate 阶段必须检查：`source_batch_id` 是否等于当前 batch，`source_query_ids` / `target_queries` 是否都属于当前 batch，`family_id` 是否唯一且不跨 family，`mv_type` 是否与可证明 rewrite 关系一致，`mv_predicates` / `generalized_predicates` / `residual_filters` 是否满足 shared upstream superset 规则，`output_columns` / `column_mappings` / `group_by_exprs` / `measure_exprs` 是否保留 residual filter、projection 和 roll-up 所需信息，`depends_on_mv_ids` 是否只引用可见历史 MV 且不形成循环，`build_sql` 是否与 Candidate spec 对齐。
+49. evaluate 阶段如果发现 Candidate 只由未来 batch 或 downstream reuse 触发，必须删除或改为 `decision = "skip"`；如果发现 Candidate 跨 family，必须拆回单 family Candidate，或记录 family 质量问题并 skip。
+50. 对外落盘的 `batch_{batch_id}_mv_candidates.json` 使用 evaluate 后的最终结果；第一阶段草稿可作为 debug artifact 保留，但不作为 ExecutorAgent 的输入。
 
 输出 JSON：
 
@@ -762,14 +818,72 @@ historical MV rewrite
         }
       ],
       "output_columns": [
-        "date_dim.d_year",
-        "date_dim.d_moy",
-        "item.i_manager_id",
-        "item.i_brand_id",
-        "item.i_brand",
-        "item.i_category_id",
-        "item.i_category",
+        "date_dim_d_year",
+        "date_dim_d_moy",
+        "item_i_manager_id",
+        "item_i_brand_id",
+        "item_i_brand",
+        "item_i_category_id",
+        "item_i_category",
         "sum_ext_sales_price"
+      ],
+      "column_mappings": [
+        {
+          "source_expr": "date_dim.d_year",
+          "source_table": "date_dim",
+          "source_column": "d_year",
+          "mv_column": "date_dim_d_year",
+          "role": "dimension"
+        },
+        {
+          "source_expr": "date_dim.d_moy",
+          "source_table": "date_dim",
+          "source_column": "d_moy",
+          "mv_column": "date_dim_d_moy",
+          "role": "filter"
+        },
+        {
+          "source_expr": "item.i_manager_id",
+          "source_table": "item",
+          "source_column": "i_manager_id",
+          "mv_column": "item_i_manager_id",
+          "role": "filter"
+        },
+        {
+          "source_expr": "item.i_brand_id",
+          "source_table": "item",
+          "source_column": "i_brand_id",
+          "mv_column": "item_i_brand_id",
+          "role": "dimension"
+        },
+        {
+          "source_expr": "item.i_brand",
+          "source_table": "item",
+          "source_column": "i_brand",
+          "mv_column": "item_i_brand",
+          "role": "dimension"
+        },
+        {
+          "source_expr": "item.i_category_id",
+          "source_table": "item",
+          "source_column": "i_category_id",
+          "mv_column": "item_i_category_id",
+          "role": "dimension"
+        },
+        {
+          "source_expr": "item.i_category",
+          "source_table": "item",
+          "source_column": "i_category",
+          "mv_column": "item_i_category",
+          "role": "dimension"
+        },
+        {
+          "source_expr": "SUM(store_sales.ss_ext_sales_price)",
+          "source_table": "store_sales",
+          "source_column": "ss_ext_sales_price",
+          "mv_column": "sum_ext_sales_price",
+          "role": "measure"
+        }
       ],
       "group_by_exprs": [
         "date_dim.d_year",
@@ -781,7 +895,7 @@ historical MV rewrite
         "item.i_category"
       ],
       "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price"],
-      "build_sql": "CREATE OR REPLACE TABLE ...",
+      "build_sql": "CREATE OR REPLACE TABLE mv_ss_dd_item_mgr1_y2000_m11_fg AS SELECT date_dim.d_year AS date_dim_d_year, date_dim.d_moy AS date_dim_d_moy, item.i_manager_id AS item_i_manager_id, item.i_brand_id AS item_i_brand_id, item.i_brand AS item_i_brand, item.i_category_id AS item_i_category_id, item.i_category AS item_i_category, SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price FROM ...",
       "decision": "materialize",
       "reason": "same family and same filter, different group by branches"
     }
@@ -809,14 +923,19 @@ historical MV rewrite
 8. final rewrite 使用当前 batch 物化成功后更新的完整 Materialized View State。
 9. 只能使用 `materialized_mvs.json` 中且 `available_from_batch <= current_batch_id` 的 Materialized View。
 10. rewritten SQL 必须保持 original SQL 输出语义。
-11. 只有当 MV 的 join key、filter 覆盖关系、group by 粒度、aggregate 表达式和 output columns 都能覆盖原 SQL 需求时，才允许 rewrite。
+11. 只有当 MV 的 join key、filter 覆盖关系、group by 粒度、aggregate 表达式和 MV 物理列都能覆盖原 SQL 需求时，才允许 rewrite。
 12. 如果不确定是否等价，必须 fallback 到与 original SQL 等价的 rewritten SQL，不能为了使用 MV 进行猜测式改写。
 13. fallback 时 `status = "fallback"`，`used_mv_ids = []`，`fallback_reason` 必须非空。
 14. 成功使用 MV 时 `status = "rewritten"`，`used_mv_ids` 必须非空，`fallback_reason = null`。
 15. final rewrite 没有可安全使用 MV 时，也必须 fallback original-equivalent SQL，并按原因填写 `fallback_reason`。
-16. 常见 fallback reason 包括：`no_available_historical_mv`、`no_matching_mv`、`mv_columns_not_covering_query`、`filter_not_implied_by_mv`、`group_by_not_compatible`、`aggregate_not_supported`、`unsupported_sql_pattern`、`semantic_equivalence_uncertain`。
+16. 常见 fallback reason 包括：`no_available_historical_mv`、`no_matching_mv`、`mv_columns_not_covering_query`、`mv_column_mappings_missing`、`mv_uses_source_qualified_columns`、`output_alias_missing`、`output_name_missing`、`filter_not_implied_by_mv`、`group_by_not_compatible`、`aggregate_not_supported`、`unsupported_sql_pattern`、`semantic_equivalence_uncertain`。
 17. 第一版支持 SUM / COUNT / AVG / MIN / MAX。
 18. 对复杂 window、rollup、count distinct、stddev、相关子查询默认 fallback。
+19. 使用 MV rewrite 时，只能引用 `materialized_mvs.json` 中的 `output_columns` 或 `column_mappings.mv_column`。
+20. rewritten SQL 不能从 MV 表中引用 `date_dim.d_year`、`` `date_dim.d_year` ``、`item.i_brand_id` 这类源表限定列名；源字段身份只用于规则判断和日志解释。
+21. rewritten SQL 必须保留 original SQL 的输出列名。显式或隐式 alias 必须保留，例如 q52 中的 `brand_id`、`brand`、`ext_price`。
+22. original SQL 中没有 alias 的表达式也必须保留 Spark 输出名。例如 q42 的 `sum(ss_ext_sales_price)` 没有 alias，rewrite 时应输出 `AS \`sum(ss_ext_sales_price)\``，不能改成 `AS sum_ext_sales_price`。
+23. 如果无法证明输出列名一致，必须 fallback 到 original-equivalent SQL。
 
 输出 JSON：
 
@@ -832,8 +951,9 @@ historical MV rewrite
       "rewritten_sql_path": "{run_id}/05_rewritten_sql/batch_3/final_rewrite/q42_rewritten.sql",
       "rewrite_meta_path": "{run_id}/05_rewritten_sql/batch_3/final_rewrite/q42_rewrite_meta.json",
       "rewrite_mode": "mv_filter_projection_rollup",
+      "rewritten_sql": "SELECT date_dim_d_year AS d_year, item_i_category_id AS i_category_id, item_i_category AS i_category, SUM(sum_ext_sales_price) AS `sum(ss_ext_sales_price)` FROM mv_ss_dd_item_mgr1_y2000_m11_fg GROUP BY date_dim_d_year, item_i_category_id, item_i_category",
       "residual_filters": [],
-      "rollup_exprs": ["GROUP BY date_dim.d_year, item.i_category_id, item.i_category"],
+      "rollup_exprs": ["GROUP BY date_dim_d_year, item_i_category_id, item_i_category"],
       "semantic_check": {
         "status": "pass",
         "reason": "query can be derived from MV by projection and roll-up"
@@ -849,6 +969,7 @@ historical MV rewrite
       "rewritten_sql_path": "{run_id}/05_rewritten_sql/batch_3/final_rewrite/q99_rewritten.sql",
       "rewrite_meta_path": "{run_id}/05_rewritten_sql/batch_3/final_rewrite/q99_rewrite_meta.json",
       "rewrite_mode": "original_equivalent",
+      "rewritten_sql": "SELECT ... FROM original_tables ...",
       "residual_filters": [],
       "rollup_exprs": [],
       "semantic_check": {
@@ -882,6 +1003,7 @@ historical MV rewrite
 9. 如果证据来自 `run_log.jsonl`，必须优先引用对应的 `event_id`。
 10. `evidence_refs` 只做证据追踪，不引入新的主数据结构。
 11. 反馈只影响人工 review 后的下一轮 run。
+12. 可以基于 BatchMVAgent / RewriteAgent / ExecutorAgent 日志反馈 MV 列映射问题，例如缺少 `column_mappings`、`output_columns` 使用源表限定列名、rewrite 丢失输出列名、execution order 依赖与 rewrite meta 不一致。
 
 输出 JSON：
 
@@ -972,6 +1094,13 @@ Agent-only 原型仍保留最低限度检查：
 20. 如果 `evidence_refs` 引用 `run_log.jsonl`，必须包含对应的 `event_id`。
 21. 如果 `evidence_refs` 引用 MV Candidate，必须包含对应的 `candidate_id`。
 22. 所有落盘路径必须位于 `llm_demo/artifacts/{run_id}/`。
+23. `decision = materialize` 的 MV Candidate 必须包含非空 `column_mappings`。
+24. `output_columns` 不能包含 `.`；它只表示 MV 表真实物理列名。
+25. `column_mappings.source_table.source_column` 必须存在于 `tpcds_simple.json`。
+26. `build_sql` 必须显式包含 `AS mv_column`，不能依赖 Spark 自动列名。
+27. RewriteAgent 使用 MV 时不能引用源表限定列名；发现 `` `date_dim.d_year` `` 或 `date_dim.d_year` 这类引用时必须 fallback。
+28. RewriteAgent 必须保持 original SQL 中显式或隐式 alias，以及无 alias 表达式的 Spark 输出名；如果无法证明一致，必须 fallback。
+29. `ExecutorAgent.run_queries(...)` 必须从 rewrite meta 读取 `used_mv_ids` 并写入 execution order；如果 rewrite meta 缺少该字段，代码层直接失败。
 
 ## 9. MVP 流程
 
@@ -992,6 +1121,8 @@ llm_demo/workflow/tpcds-spark/q52.sql
 4. 验证 `BatchClusterAgent` 能把 q42/q52 作为 SQL 放入 `join_filter_groupby` global batch，并在该 batch 的 `family_groups` 中归入同一个 family。
 5. 验证 `BatchMVAgent` 能基于同 family 生成候选 MV。
 6. 验证 `RewriteAgent` 和 `ExecutorAgent` 能 dry-run 落盘 rewritten SQL 和日志。
+7. 验证 MV Candidate 使用 `column_mappings` 和稳定 MV 物理列名，final rewrite 不再引用源表限定列名。
+8. 验证 execution order 中 query step 的 `depends_on_mv_ids` 与 rewrite meta 的 `used_mv_ids` 一致。
 
 注意：q42/q52 主要验证同 family 和 batch 内 MV 链路，不足以验证跨 batch 复用。
 
@@ -1026,7 +1157,9 @@ execution:
 3. rewritten SQL 落盘。
 4. 被 skip 或物化失败的 MV Candidate 保留在 `batch_{batch_id}_mv_candidates.json` 和 `run_log.jsonl`。
 5. 依赖历史 MV 不可用的 MV Candidate 视为物化失败，不写入 `materialized_mvs.json`，不阻断后续 query dry-run。
-6. 生成 run log。
+6. `ExecutorAgent.run_queries(...)` 按 `ComplexityBatch.query_ids` 顺序生成 `batch_{batch_id}_execution_order.json`。
+7. execution order 中的 `run_query.depends_on_mv_ids` 必须与对应 `{query_id}_rewrite_meta.json` 的 `used_mv_ids` 一致。
+8. 生成 run log。
 
 后续切换：
 
@@ -1094,6 +1227,7 @@ rules/*.md
 src/core/agent_base.py
 src/core/llm_client.py
 src/core/artifact_store.py
+src/core/physical_schema.py
 src/core/schemas.py
 src/agents/sql_loader_agent.py
 src/agents/feature_agent.py
@@ -1109,6 +1243,7 @@ src/agents/self_iteration_agent.py
 
 ```text
 .env
+tpcds_simple.json
 ```
 
 跑通后应能生成：
@@ -1120,6 +1255,7 @@ artifacts/{run_id}/03_batches/complexity_batches.json
 artifacts/{run_id}/04_batch_mvs/*.sql
 artifacts/{run_id}/04_batch_mvs/materialized_mvs.json
 artifacts/{run_id}/05_rewritten_sql/*.sql
+artifacts/{run_id}/06_execution_logs/batch_{batch_id}_execution_order.json
 artifacts/{run_id}/06_execution_logs/run_log.jsonl
 artifacts/{run_id}/07_feedback/feedback_rules_{run_id}.json
 ```

@@ -19,9 +19,14 @@
 13. 成功使用 MV 时 `status = "rewritten"`，`used_mv_ids` 必须非空，`fallback_reason = null`。
 14. 每条 rewrite meta 必须包含 `query_id`、`rewrite_stage`、`original_sql_path`、`rewritten_sql_path`、`used_mv_ids`、`status`、`rewrite_mode`、`semantic_check` 和 `fallback_reason`。
 15. 每次 rewrite 必须写 run log，记录输入 artifact、输出 rewritten SQL、输出 rewrite meta、rewrite 状态、使用 MV 和 fallback 原因。
-16. 常见 fallback reason 包括：`no_available_historical_mv`、`no_matching_mv`、`mv_columns_not_covering_query`、`filter_not_implied_by_mv`、`group_by_not_compatible`、`aggregate_not_supported`、`unsupported_sql_pattern`、`semantic_equivalence_uncertain`。
+16. 常见 fallback reason 包括：`no_available_historical_mv`、`no_matching_mv`、`mv_columns_not_covering_query`、`mv_column_mappings_missing`、`mv_uses_source_qualified_columns`、`output_alias_missing`、`output_name_missing`、`filter_not_implied_by_mv`、`group_by_not_compatible`、`aggregate_not_supported`、`unsupported_sql_pattern`、`semantic_equivalence_uncertain`。
 17. 第一版支持 SUM / COUNT / AVG / MIN / MAX 的保守 rewrite。
 18. 对复杂 window、rollup、count distinct、stddev、相关子查询默认 fallback。
+19. 使用 MV rewrite 时，只能引用 `materialized_mvs.json` 中记录的 MV 物理列名，也就是 `output_columns` / `column_mappings.mv_column`。
+20. 不允许在从 MV 读取的 rewritten SQL 中使用源表限定列名，例如 `` `date_dim.d_year` ``、`date_dim.d_year`、`item.i_brand_id`；这类字段身份只能来自 `column_mappings`。
+21. rewritten SQL 必须保持 original SQL 的输出列名。显式或隐式 alias 必须保留，例如 `item.i_brand_id brand_id`、`item.i_brand brand`、`sum(ss_ext_sales_price) ext_price` 在 rewritten SQL 中仍应输出 `brand_id`、`brand`、`ext_price`。
+22. original SQL 中没有 alias 的表达式也必须保留 Spark 输出名。例如 q42 的 `sum(ss_ext_sales_price)` 没有 alias，rewrite 时应输出 `AS \`sum(ss_ext_sales_price)\``，不能改成 `AS sum_ext_sales_price`。
+23. 如果无法证明 MV 物理列覆盖和输出列名一致，必须 fallback 到 original-equivalent SQL。
 
 # 输出路径约定
 
@@ -53,10 +58,10 @@ final rewrite：
       "rewritten_sql_path": "05_rewritten_sql/batch_3/final_rewrite/q42_rewritten.sql",
       "rewrite_meta_path": "05_rewritten_sql/batch_3/final_rewrite/q42_rewrite_meta.json",
       "rewrite_mode": "mv_filter_projection_rollup",
-      "rewritten_sql": "SELECT date_dim.d_year, item.i_category_id, item.i_category, SUM(sum_ext_sales_price) AS sum_ext_sales_price FROM mv_ss_dd_item_q42_q52_fg GROUP BY date_dim.d_year, item.i_category_id, item.i_category",
+      "rewritten_sql": "SELECT date_dim_d_year AS d_year, item_i_category_id AS i_category_id, item_i_category AS i_category, SUM(sum_ext_sales_price) AS `sum(ss_ext_sales_price)` FROM mv_ss_dd_item_q42_q52_fg GROUP BY date_dim_d_year, item_i_category_id, item_i_category",
       "residual_filters": [],
       "rollup_exprs": [
-        "GROUP BY date_dim.d_year, item.i_category_id, item.i_category"
+        "GROUP BY date_dim_d_year, item_i_category_id, item_i_category"
       ],
       "semantic_check": {
         "status": "pass",

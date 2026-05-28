@@ -78,6 +78,14 @@ class ResidualFilter(BaseModel):
     predicates: list[str] = Field(default_factory=list)
 
 
+class MVColumnMapping(BaseModel):
+    source_expr: str
+    source_table: str
+    source_column: str
+    mv_column: str
+    role: str
+
+
 class MVCandidate(BaseModel):
     candidate_id: str
     source_batch_id: int
@@ -94,6 +102,7 @@ class MVCandidate(BaseModel):
     generalized_predicates: list[GeneralizedPredicate] = Field(default_factory=list)
     residual_filters: list[ResidualFilter] = Field(default_factory=list)
     output_columns: list[str] = Field(default_factory=list)
+    column_mappings: list[MVColumnMapping] = Field(default_factory=list)
     group_by_exprs: list[str] = Field(default_factory=list)
     measure_exprs: list[str] = Field(default_factory=list)
     build_sql: str | None = None

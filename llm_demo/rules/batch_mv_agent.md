@@ -35,16 +35,22 @@ BatchMVAgent 固定采用两次 LLM + rules 调用：
 20. 如果 build SQL 依赖历史 MV，必须在 `depends_on_mv_ids` 中记录直接依赖；不依赖历史 MV 时使用空数组。
 21. `depends_on_mv_ids` 只能引用已成功物化且当前 batch 可见的 MV。
 22. `decision = "materialize"` 的 Candidate 必须包含 `mv_id`、`target_table_name` 和可执行 `build_sql`。
-23. `decision = "skip"` 可以不包含 `build_sql` 和 `mv_id`，但仍需保留 `candidate_id`、`source_batch_id`、`source_query_ids`、`family_id`、`target_queries`、`decision` 和 `reason`。
-24. evaluate 阶段必须检查 `source_batch_id` 是否等于当前 batch。
-25. evaluate 阶段必须检查 `source_query_ids` 和 `target_queries` 是否都属于当前 batch，且不能使用未来 batch Query 作为结构化 target。
-26. evaluate 阶段必须检查每个 Candidate 是否只绑定一个 `family_id`；跨 family Candidate 必须拆回单 family，或记录 family 质量问题并 skip。
-27. evaluate 阶段必须检查 `mv_type` 是否与可证明 rewrite 关系一致：能安全 roll-up 才能使用 `fine_grain_aggregate`，否则 fallback 到 `detail_superset`，仍不安全则 skip。
-28. evaluate 阶段必须检查 `mv_predicates`、`generalized_predicates` 和 `residual_filters`：共同 predicate shape 才能进入 MV predicate，非共同 predicate 必须进入对应 query 的 residual filter。
-29. evaluate 阶段必须检查 `output_columns`、`group_by_exprs` 和 `measure_exprs` 是否保留 residual filter、projection 和 roll-up 所需信息。
-30. evaluate 阶段必须检查 `depends_on_mv_ids` 是否只引用当前 batch 可见的已物化 MV，且不会形成依赖循环。
-31. evaluate 阶段必须检查 `build_sql` 是否与 Candidate spec 对齐，包括 predicate、输出列、group by、measure 和历史 MV 依赖。
-32. 如果 Candidate 只由未来复用价值触发，而没有当前 batch 的 Query 或 QueryFamily 依据，evaluate 必须删除该 Candidate 或改为 `decision = "skip"`。
+23. `decision = "materialize"` 的 Candidate 必须包含非空 `column_mappings`，用于记录源字段到 MV 物理列的映射。
+24. `output_columns` 只能写 MV 的真实物理列名，不能写 `date_dim.d_year` 这类源表限定列名。
+25. 对直接来自物理表字段的 dimension / filter / projection 列，`mv_column` 使用 `{source_table}_{source_column}`，例如 `date_dim_d_year`、`item_i_brand_id`。
+26. measure 列必须使用稳定聚合别名，例如 `sum_ext_sales_price`。
+27. `build_sql` 中每个输出表达式都必须显式 `AS mv_column`，例如 `date_dim.d_year AS date_dim_d_year`。
+28. `decision = "skip"` 可以不包含 `build_sql` 和 `mv_id`，但仍需保留 `candidate_id`、`source_batch_id`、`source_query_ids`、`family_id`、`target_queries`、`decision` 和 `reason`。
+29. evaluate 阶段必须检查 `source_batch_id` 是否等于当前 batch。
+30. evaluate 阶段必须检查 `source_query_ids` 和 `target_queries` 是否都属于当前 batch，且不能使用未来 batch Query 作为结构化 target。
+31. evaluate 阶段必须检查每个 Candidate 是否只绑定一个 `family_id`；跨 family Candidate 必须拆回单 family，或记录 family 质量问题并 skip。
+32. evaluate 阶段必须检查 `mv_type` 是否与可证明 rewrite 关系一致：能安全 roll-up 才能使用 `fine_grain_aggregate`，否则 fallback 到 `detail_superset`，仍不安全则 skip。
+33. evaluate 阶段必须检查 `mv_predicates`、`generalized_predicates` 和 `residual_filters`：共同 predicate shape 才能进入 MV predicate，非共同 predicate 必须进入对应 query 的 residual filter。
+34. evaluate 阶段必须检查 `output_columns`、`group_by_exprs` 和 `measure_exprs` 是否保留 residual filter、projection 和 roll-up 所需信息。
+35. evaluate 阶段必须检查 `depends_on_mv_ids` 是否只引用当前 batch 可见的已物化 MV，且不会形成依赖循环。
+36. evaluate 阶段必须检查 `build_sql` 是否与 Candidate spec 对齐，包括 predicate、输出列、group by、measure 和历史 MV 依赖。
+37. 如果 Candidate 只由未来复用价值触发，而没有当前 batch 的 Query 或 QueryFamily 依据，evaluate 必须删除该 Candidate 或改为 `decision = "skip"`。
+38. evaluate 阶段必须检查 `column_mappings` 是否覆盖所有 `output_columns`，且 `source_table.source_column` 来自物理表字段。
 
 # 示例 1：q42/q52 生成 fine-grain aggregate superset MV
 
@@ -96,14 +102,72 @@ q52: date_dim.d_year, item.i_brand, item.i_brand_id
         }
       ],
       "output_columns": [
-        "date_dim.d_year",
-        "date_dim.d_moy",
-        "item.i_manager_id",
-        "item.i_category_id",
-        "item.i_category",
-        "item.i_brand",
-        "item.i_brand_id",
+        "date_dim_d_year",
+        "date_dim_d_moy",
+        "item_i_manager_id",
+        "item_i_category_id",
+        "item_i_category",
+        "item_i_brand",
+        "item_i_brand_id",
         "sum_ext_sales_price"
+      ],
+      "column_mappings": [
+        {
+          "source_expr": "date_dim.d_year",
+          "source_table": "date_dim",
+          "source_column": "d_year",
+          "mv_column": "date_dim_d_year",
+          "role": "dimension"
+        },
+        {
+          "source_expr": "date_dim.d_moy",
+          "source_table": "date_dim",
+          "source_column": "d_moy",
+          "mv_column": "date_dim_d_moy",
+          "role": "filter"
+        },
+        {
+          "source_expr": "item.i_manager_id",
+          "source_table": "item",
+          "source_column": "i_manager_id",
+          "mv_column": "item_i_manager_id",
+          "role": "filter"
+        },
+        {
+          "source_expr": "item.i_category_id",
+          "source_table": "item",
+          "source_column": "i_category_id",
+          "mv_column": "item_i_category_id",
+          "role": "dimension"
+        },
+        {
+          "source_expr": "item.i_category",
+          "source_table": "item",
+          "source_column": "i_category",
+          "mv_column": "item_i_category",
+          "role": "dimension"
+        },
+        {
+          "source_expr": "item.i_brand",
+          "source_table": "item",
+          "source_column": "i_brand",
+          "mv_column": "item_i_brand",
+          "role": "dimension"
+        },
+        {
+          "source_expr": "item.i_brand_id",
+          "source_table": "item",
+          "source_column": "i_brand_id",
+          "mv_column": "item_i_brand_id",
+          "role": "dimension"
+        },
+        {
+          "source_expr": "SUM(store_sales.ss_ext_sales_price)",
+          "source_table": "store_sales",
+          "source_column": "ss_ext_sales_price",
+          "mv_column": "sum_ext_sales_price",
+          "role": "measure"
+        }
       ],
       "group_by_exprs": [
         "date_dim.d_year",
@@ -117,7 +181,7 @@ q52: date_dim.d_year, item.i_brand, item.i_brand_id
       "measure_exprs": [
         "SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price"
       ],
-      "build_sql": "CREATE OR REPLACE TABLE mv_ss_dd_item_q42_q52_fg AS SELECT date_dim.d_year, date_dim.d_moy, item.i_manager_id, item.i_category_id, item.i_category, item.i_brand, item.i_brand_id, SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price FROM date_dim JOIN store_sales ON date_dim.d_date_sk = store_sales.ss_sold_date_sk JOIN item ON store_sales.ss_item_sk = item.i_item_sk WHERE item.i_manager_id = 1 AND date_dim.d_moy = 11 AND date_dim.d_year IN (2000) GROUP BY date_dim.d_year, date_dim.d_moy, item.i_manager_id, item.i_category_id, item.i_category, item.i_brand, item.i_brand_id",
+      "build_sql": "CREATE OR REPLACE TABLE mv_ss_dd_item_q42_q52_fg AS SELECT date_dim.d_year AS date_dim_d_year, date_dim.d_moy AS date_dim_d_moy, item.i_manager_id AS item_i_manager_id, item.i_category_id AS item_i_category_id, item.i_category AS item_i_category, item.i_brand AS item_i_brand, item.i_brand_id AS item_i_brand_id, SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price FROM date_dim JOIN store_sales ON date_dim.d_date_sk = store_sales.ss_sold_date_sk JOIN item ON store_sales.ss_item_sk = item.i_item_sk WHERE item.i_manager_id = 1 AND date_dim.d_moy = 11 AND date_dim.d_year IN (2000) GROUP BY date_dim.d_year, date_dim.d_moy, item.i_manager_id, item.i_category_id, item.i_category, item.i_brand, item.i_brand_id",
       "decision": "materialize",
       "reason": "q42 and q52 share join/filter and have roll-up-compatible SUM measures; fine-grain aggregate preserves both category and brand dimensions"
     }
@@ -178,10 +242,40 @@ date_dim.d_year IN (2000, 2001)
   "mv_type": "detail_superset",
   "mv_predicates": ["date_dim.d_year IN (2000, 2001)"],
   "output_columns": [
-    "date_dim.d_year",
-    "date_dim.d_moy",
-    "store_sales.ss_item_sk",
-    "store_sales.ss_ext_sales_price"
+    "date_dim_d_year",
+    "date_dim_d_moy",
+    "store_sales_ss_item_sk",
+    "store_sales_ss_ext_sales_price"
+  ],
+  "column_mappings": [
+    {
+      "source_expr": "date_dim.d_year",
+      "source_table": "date_dim",
+      "source_column": "d_year",
+      "mv_column": "date_dim_d_year",
+      "role": "dimension"
+    },
+    {
+      "source_expr": "date_dim.d_moy",
+      "source_table": "date_dim",
+      "source_column": "d_moy",
+      "mv_column": "date_dim_d_moy",
+      "role": "filter"
+    },
+    {
+      "source_expr": "store_sales.ss_item_sk",
+      "source_table": "store_sales",
+      "source_column": "ss_item_sk",
+      "mv_column": "store_sales_ss_item_sk",
+      "role": "detail"
+    },
+    {
+      "source_expr": "store_sales.ss_ext_sales_price",
+      "source_table": "store_sales",
+      "source_column": "ss_ext_sales_price",
+      "mv_column": "store_sales_ss_ext_sales_price",
+      "role": "measure_source"
+    }
   ],
   "residual_filters": [
     {

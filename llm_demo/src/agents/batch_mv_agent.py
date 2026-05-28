@@ -7,6 +7,7 @@ from typing import Any
 from llm_demo.src.core.agent_base import LLMRulesAgent
 from llm_demo.src.core.artifact_store import ArtifactStore
 from llm_demo.src.core.llm_client import LLMClient
+from llm_demo.src.core.physical_schema import load_physical_schema, validate_physical_column
 from llm_demo.src.core.schemas import BatchMVOutput
 
 
@@ -145,6 +146,7 @@ class BatchMVAgent(LLMRulesAgent):
             for mv in materialized_mvs.get("materialized_mvs", [])
             if mv.get("available_from_batch", batch_id) <= batch_id
         }
+        physical_schema = load_physical_schema(self.store.project_root)
         seen_candidate_ids: set[str] = set()
         for candidate in output["mv_candidates"]:
             candidate_id = candidate["candidate_id"]
@@ -182,6 +184,35 @@ class BatchMVAgent(LLMRulesAgent):
                 ]
                 if missing:
                     raise ValueError(f"Candidate {candidate_id} decision=materialize missing {missing}")
+                self._validate_materialized_columns(candidate, physical_schema)
+
+    def _validate_materialized_columns(self, candidate: dict[str, Any], physical_schema: dict[str, set[str]]) -> None:
+        candidate_id = candidate["candidate_id"]
+        mappings = candidate.get("column_mappings", [])
+        if not mappings:
+            raise ValueError(f"Candidate {candidate_id} decision=materialize missing column_mappings")
+
+        output_columns = candidate.get("output_columns", [])
+        dotted_columns = [column for column in output_columns if "." in column]
+        if dotted_columns:
+            raise ValueError(f"Candidate {candidate_id} output_columns must be MV physical columns, got {dotted_columns}")
+
+        mapped_columns = {mapping["mv_column"] for mapping in mappings}
+        missing_mappings = [column for column in output_columns if column not in mapped_columns]
+        if missing_mappings:
+            raise ValueError(f"Candidate {candidate_id} output_columns missing column_mappings for {missing_mappings}")
+
+        build_sql = candidate.get("build_sql") or ""
+        lower_build_sql = build_sql.lower()
+        for mapping in mappings:
+            validate_physical_column(physical_schema, mapping["source_table"], mapping["source_column"])
+            mv_column = mapping["mv_column"]
+            if f" as {mv_column.lower()}" not in lower_build_sql:
+                raise ValueError(f"Candidate {candidate_id} build_sql must explicitly alias {mv_column}")
+            if mapping["role"] != "measure" and mapping["mv_column"] != f"{mapping['source_table']}_{mapping['source_column']}":
+                raise ValueError(
+                    f"Candidate {candidate_id} mv_column {mv_column} must use source_table_source_column naming"
+                )
 
     def _render_build_sql(self, output: dict[str, Any]) -> str:
         statements = []

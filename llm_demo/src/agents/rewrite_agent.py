@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,7 @@ class RewriteAgent(LLMRulesAgent):
             input_artifacts={**input_artifacts, "candidate_rewrite_output": candidate_output},
             output_model=RewriteOutput,
         )
+        output = self._apply_safety_fallbacks(output, materialized_mvs, queries)
         self._validate_output(output, current_batch, materialized_mvs, batch_id, rewrite_stage)
 
         rewrite_dir_relative = f"05_rewritten_sql/batch_{batch_id}/{rewrite_stage}_rewrite"
@@ -160,6 +162,152 @@ class RewriteAgent(LLMRulesAgent):
                     raise ValueError(f"Rewritten query {record['query_id']} uses unavailable MV {used_mv_ids - available_mv_ids}")
                 if record.get("fallback_reason") is not None:
                     raise ValueError(f"Rewritten query {record['query_id']} must have fallback_reason=null")
+
+    def _apply_safety_fallbacks(
+        self,
+        output: dict[str, Any],
+        materialized_mvs: dict[str, Any],
+        queries: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        queries_by_id = {query["query_id"]: query for query in queries}
+        mv_by_id = {mv["mv_id"]: mv for mv in materialized_mvs.get("materialized_mvs", [])}
+        for record in output.get("rewrites", []):
+            if record["status"] != "rewritten":
+                continue
+            query = queries_by_id.get(record["query_id"])
+            if not query:
+                continue
+            reason = self._rewrite_fallback_reason(record, mv_by_id, query["original_sql"])
+            if reason:
+                self._convert_to_fallback(record, query, reason)
+        return output
+
+    def _rewrite_fallback_reason(self, record: dict[str, Any], mv_by_id: dict[str, dict[str, Any]], original_sql: str) -> str | None:
+        for mv_id in record.get("used_mv_ids", []):
+            mv = mv_by_id.get(mv_id)
+            if not mv:
+                continue
+            mappings = mv.get("column_mappings", [])
+            if not mappings:
+                return "mv_column_mappings_missing"
+            if self._uses_source_qualified_columns(record["rewritten_sql"], mappings):
+                return "mv_uses_source_qualified_columns"
+
+        required_aliases = self._required_output_aliases(original_sql)
+        if required_aliases and not self._select_clause_contains_aliases(record["rewritten_sql"], required_aliases):
+            return "output_alias_missing"
+        required_output_names = self._required_unaliased_output_names(original_sql)
+        if required_output_names and not self._select_clause_contains_output_names(record["rewritten_sql"], required_output_names):
+            return "output_name_missing"
+        return None
+
+    def _uses_source_qualified_columns(self, rewritten_sql: str, mappings: list[dict[str, Any]]) -> bool:
+        lower_sql = rewritten_sql.lower()
+        if re.search(r"`[^`]*\.[^`]*`", lower_sql):
+            return True
+        for mapping in mappings:
+            source_ref = f"{mapping['source_table']}.{mapping['source_column']}".lower()
+            if source_ref in lower_sql:
+                return True
+        return False
+
+    def _required_output_aliases(self, original_sql: str) -> list[str]:
+        select_clause = self._select_clause(original_sql)
+        aliases: list[str] = []
+        for item in self._split_select_items(select_clause):
+            stripped = item.strip().rstrip(",")
+            explicit = self._explicit_alias(stripped)
+            if explicit:
+                aliases.append(explicit)
+                continue
+            implicit = self._implicit_alias(stripped)
+            if implicit:
+                aliases.append(implicit)
+        return aliases
+
+    def _select_clause_contains_aliases(self, rewritten_sql: str, required_aliases: list[str]) -> bool:
+        return self._select_clause_contains_output_names(rewritten_sql, required_aliases)
+
+    def _required_unaliased_output_names(self, original_sql: str) -> list[str]:
+        select_clause = self._select_clause(original_sql)
+        output_names: list[str] = []
+        for item in self._split_select_items(select_clause):
+            stripped = item.strip().rstrip(",")
+            if self._explicit_alias(stripped) or self._implicit_alias(stripped):
+                continue
+            simple_column = re.fullmatch(r"(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)", stripped)
+            if simple_column:
+                output_names.append(simple_column.group(1))
+            else:
+                output_names.append(stripped)
+        return output_names
+
+    def _select_clause_contains_output_names(self, rewritten_sql: str, output_names: list[str]) -> bool:
+        select_clause = self._select_clause(rewritten_sql)
+        rewritten_items = [self._normalize_sql_text(item) for item in self._split_select_items(select_clause)]
+        return all(self._select_clause_contains_output_name(rewritten_items, output_name) for output_name in output_names)
+
+    def _select_clause_contains_output_name(self, rewritten_items: list[str], output_name: str) -> bool:
+        normalized_name = self._normalize_sql_text(output_name)
+        for item in rewritten_items:
+            if item == normalized_name:
+                return True
+            if re.search(rf"\bas\s+{re.escape(normalized_name)}\s*$", item):
+                return True
+            if re.search(rf"\bas\s+`{re.escape(normalized_name)}`\s*$", item):
+                return True
+            if item.endswith(f" {normalized_name}") or item.endswith(f" `{normalized_name}`"):
+                return True
+        return False
+
+    def _explicit_alias(self, select_item: str) -> str | None:
+        match = re.search(r"\bas\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$", select_item, flags=re.IGNORECASE)
+        return match.group(1) if match else None
+
+    def _implicit_alias(self, select_item: str) -> str | None:
+        match = re.search(r"(.+)\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", select_item)
+        if not match:
+            return None
+        return match.group(2)
+
+    def _normalize_sql_text(self, text: str) -> str:
+        return re.sub(r"\s+", " ", text.strip()).lower()
+
+    def _select_clause(self, sql: str) -> str:
+        match = re.search(r"\bselect\b(.*?)\bfrom\b", sql, flags=re.IGNORECASE | re.DOTALL)
+        return match.group(1) if match else ""
+
+    def _split_select_items(self, select_clause: str) -> list[str]:
+        items: list[str] = []
+        current: list[str] = []
+        depth = 0
+        for char in select_clause:
+            if char == "(":
+                depth += 1
+            elif char == ")" and depth:
+                depth -= 1
+            if char == "," and depth == 0:
+                items.append("".join(current))
+                current = []
+            else:
+                current.append(char)
+        if current:
+            items.append("".join(current))
+        return items
+
+    def _convert_to_fallback(self, record: dict[str, Any], query: dict[str, str], reason: str) -> None:
+        record["status"] = "fallback"
+        record["used_mv_ids"] = []
+        record["rewrite_mode"] = "original_equivalent"
+        record["rewritten_sql"] = query["original_sql"]
+        record["original_sql_path"] = query["original_sql_path"]
+        record["residual_filters"] = []
+        record["rollup_exprs"] = []
+        record["semantic_check"] = {
+            "status": "fallback",
+            "reason": f"unsafe MV rewrite downgraded to original-equivalent SQL: {reason}",
+        }
+        record["fallback_reason"] = reason
 
     def _write_rewrites(
         self,

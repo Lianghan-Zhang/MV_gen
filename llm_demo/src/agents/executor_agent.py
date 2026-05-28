@@ -95,6 +95,10 @@ class ExecutorAgent(BaseAgent):
                 raise FileNotFoundError(f"Missing rewritten SQL for {query_id}: {sql_path}")
             if not meta_path.exists():
                 raise FileNotFoundError(f"Missing rewrite meta for {query_id}: {meta_path}")
+            meta = self.store.read_json(meta_path)
+            if "used_mv_ids" not in meta:
+                raise ValueError(f"Rewrite meta for {query_id} missing used_mv_ids")
+            used_mv_ids = meta["used_mv_ids"]
             steps.append(
                 {
                     "step_order": len(steps) + 1,
@@ -104,7 +108,7 @@ class ExecutorAgent(BaseAgent):
                     "sql_path": str(sql_path),
                     "meta_path": str(meta_path),
                     "reason": "dry-run query execution order",
-                    "depends_on_mv_ids": [],
+                    "depends_on_mv_ids": used_mv_ids,
                 }
             )
             self.store.append_run_log(
@@ -114,7 +118,12 @@ class ExecutorAgent(BaseAgent):
                 output_artifact_paths=[self._execution_order_path(batch_id)],
                 elapsed_ms=self._elapsed_ms(started_at),
                 batch_id=batch_id,
-                details={"query_id": query_id, "sql_path": str(sql_path), "meta_path": str(meta_path)},
+                details={
+                    "query_id": query_id,
+                    "sql_path": str(sql_path),
+                    "meta_path": str(meta_path),
+                    "used_mv_ids": used_mv_ids,
+                },
             )
 
         return self._write_execution_order(batch_id, steps)
@@ -142,6 +151,7 @@ class ExecutorAgent(BaseAgent):
             "group_by_exprs": candidate.get("group_by_exprs", []),
             "measure_exprs": candidate.get("measure_exprs", []),
             "output_columns": candidate.get("output_columns", []),
+            "column_mappings": candidate.get("column_mappings", []),
             "build_sql_path": str(build_sql_path),
         }
 

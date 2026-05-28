@@ -17,7 +17,9 @@ ExecutorAgent 第一版只做 dry-run，不连接 Spark，不真实执行 SQL。
 11. 运行顺序统一写入 `06_execution_logs/batch_{batch_id}_execution_order.json`。
 12. execution order 中必须包含 `materialize_mv` 和 `run_query` 两类 step。
 13. `materialize_mv` step 记录 `candidate_id`、`mv_id`、`status`、`sql_path`、`depends_on_mv_ids` 和 `reason`。
-14. `run_query` step 记录 `query_id`、`status = "planned"`、`sql_path` 和 `meta_path`。
+14. `run_query` step 记录 `query_id`、`status = "planned"`、`sql_path`、`meta_path` 和 `depends_on_mv_ids`。
+15. `run_query.depends_on_mv_ids` 必须直接来自对应 `{query_id}_rewrite_meta.json` 的 `used_mv_ids`。
+16. 如果 rewrite meta 缺少 `used_mv_ids`，不能推断依赖，必须直接失败。
 
 # 示例
 
@@ -44,7 +46,8 @@ ExecutorAgent 第一版只做 dry-run，不连接 Spark，不真实执行 SQL。
       "query_id": "q42",
       "sql_path": "05_rewritten_sql/batch_3/final_rewrite/q42_rewritten.sql",
       "meta_path": "05_rewritten_sql/batch_3/final_rewrite/q42_rewrite_meta.json",
-      "reason": "dry-run query execution order"
+      "reason": "dry-run query execution order",
+      "depends_on_mv_ids": ["mv_ss_dd_item_q42_q52_fg"]
     }
   ]
 }

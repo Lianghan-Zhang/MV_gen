@@ -22,6 +22,9 @@
 16. 可以基于 RewriteAgent 的 fallback 日志提出规则建议，例如 fallback_reason 过于笼统、可用 MV 未被使用、rewrite_stage 混淆或 used_mv_ids 不合法。
 17. 可以基于 ExecutorAgent 的 dry-run 日志提出规则建议，例如 MV 依赖缺失导致物化失败、execution order 缺少 run_query step、query 顺序与 ComplexityBatch 不一致。
 18. 如果证据来自 execution order artifact，应在 `evidence_refs.artifact` 中指向 `batch_{batch_id}_execution_order.json`，并在 `reason` 中说明相关 step。
+19. 可以基于 BatchMVAgent 或 ExecutorAgent 日志提出 MV 列映射建议，例如 materialize candidate 缺少 `column_mappings`、`output_columns` 仍使用源表限定列名、build SQL 缺少显式 `AS mv_column`。
+20. 可以基于 RewriteAgent fallback 日志提出 rewrite 规则建议，例如 `mv_uses_source_qualified_columns` 表示 rewritten SQL 错误引用了源表限定列名，`output_alias_missing` 表示显式或隐式 alias 未保持，`output_name_missing` 表示无 alias 表达式的原始输出列名未保持。
+21. 如果 execution order 中的 `run_query.depends_on_mv_ids` 与对应 rewrite meta 的 `used_mv_ids` 不一致，应建议修正 ExecutorAgent 规则或实现。
 
 # 示例
 
