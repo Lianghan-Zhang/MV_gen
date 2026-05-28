@@ -1,6 +1,6 @@
 # ETL MV Agent-Only 原型实现方案
 
-> 版本：v1.43  
+> 版本：v1.44  
 > 日期：2026-05-28  
 > 目标：在 `llm_demo/` 中先用轻量 Agent 串通 ETL MV 编排流程。除 `SQLLoaderAgent` 和 `ExecutorAgent` 外，其余 Agent 均采用 `LLM + rules` 实现。第一版优先验证流程闭环，后续再逐步替换为确定性算法实现。
 
@@ -71,6 +71,7 @@ SQLLoaderAgent(code)
 45. `tpcds_simple.json` 只作为物理表字段白名单，用于校验 `source_table.source_column` 是否存在；不生成新的 artifact，不做 SQL 自动修复。
 46. RewriteAgent 使用 MV 时只能引用 MV 物理列名；如果 rewritten SQL 仍引用源表限定列名，或丢失 original SQL 的输出列名，必须 fallback。
 47. `ExecutorAgent.run_queries(...)` 输出的 execution order 中，`run_query.depends_on_mv_ids` 必须来自对应 rewrite meta 的 `used_mv_ids`。
+48. `BatchMVAgent` 的 `build_sql` 统一使用 `CREATE TABLE ... AS SELECT ...`；不生成 `CREATE OR REPLACE TABLE`，避免原型 dry-run / 后续 Spark 执行阶段引入覆盖已有表的语义。
 
 ## 1. 工作目录
 
@@ -770,9 +771,10 @@ historical MV rewrite
 45. 对直接来自物理表字段的 dimension / filter / projection 列，`mv_column` 使用 `{source_table}_{source_column}`；measure 列使用稳定聚合别名，例如 `sum_ext_sales_price`。
 46. `build_sql` 中每个输出表达式必须显式 `AS mv_column`，例如 `date_dim.d_year AS date_dim_d_year`。
 47. `column_mappings.source_table.source_column` 必须能在 `tpcds_simple.json` 中找到；代码层只校验，不自动修复 SQL。
-48. evaluate 阶段必须检查：`source_batch_id` 是否等于当前 batch，`source_query_ids` / `target_queries` 是否都属于当前 batch，`family_id` 是否唯一且不跨 family，`mv_type` 是否与可证明 rewrite 关系一致，`mv_predicates` / `generalized_predicates` / `residual_filters` 是否满足 shared upstream superset 规则，`output_columns` / `column_mappings` / `group_by_exprs` / `measure_exprs` 是否保留 residual filter、projection 和 roll-up 所需信息，`depends_on_mv_ids` 是否只引用可见历史 MV 且不形成循环，`build_sql` 是否与 Candidate spec 对齐。
-49. evaluate 阶段如果发现 Candidate 只由未来 batch 或 downstream reuse 触发，必须删除或改为 `decision = "skip"`；如果发现 Candidate 跨 family，必须拆回单 family Candidate，或记录 family 质量问题并 skip。
-50. 对外落盘的 `batch_{batch_id}_mv_candidates.json` 使用 evaluate 后的最终结果；第一阶段草稿可作为 debug artifact 保留，但不作为 ExecutorAgent 的输入。
+48. `build_sql` 必须使用 `CREATE TABLE ... AS SELECT ...`，不要使用 `CREATE OR REPLACE TABLE`。
+49. evaluate 阶段必须检查：`source_batch_id` 是否等于当前 batch，`source_query_ids` / `target_queries` 是否都属于当前 batch，`family_id` 是否唯一且不跨 family，`mv_type` 是否与可证明 rewrite 关系一致，`mv_predicates` / `generalized_predicates` / `residual_filters` 是否满足 shared upstream superset 规则，`output_columns` / `column_mappings` / `group_by_exprs` / `measure_exprs` 是否保留 residual filter、projection 和 roll-up 所需信息，`depends_on_mv_ids` 是否只引用可见历史 MV 且不形成循环，`build_sql` 是否与 Candidate spec 对齐。
+50. evaluate 阶段如果发现 Candidate 只由未来 batch 或 downstream reuse 触发，必须删除或改为 `decision = "skip"`；如果发现 Candidate 跨 family，必须拆回单 family Candidate，或记录 family 质量问题并 skip。
+51. 对外落盘的 `batch_{batch_id}_mv_candidates.json` 使用 evaluate 后的最终结果；第一阶段草稿可作为 debug artifact 保留，但不作为 ExecutorAgent 的输入。
 
 输出 JSON：
 
@@ -895,7 +897,7 @@ historical MV rewrite
         "item.i_category"
       ],
       "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price"],
-      "build_sql": "CREATE OR REPLACE TABLE mv_ss_dd_item_mgr1_y2000_m11_fg AS SELECT date_dim.d_year AS date_dim_d_year, date_dim.d_moy AS date_dim_d_moy, item.i_manager_id AS item_i_manager_id, item.i_brand_id AS item_i_brand_id, item.i_brand AS item_i_brand, item.i_category_id AS item_i_category_id, item.i_category AS item_i_category, SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price FROM ...",
+      "build_sql": "CREATE TABLE mv_ss_dd_item_mgr1_y2000_m11_fg AS SELECT date_dim.d_year AS date_dim_d_year, date_dim.d_moy AS date_dim_d_moy, item.i_manager_id AS item_i_manager_id, item.i_brand_id AS item_i_brand_id, item.i_brand AS item_i_brand, item.i_category_id AS item_i_category_id, item.i_category AS item_i_category, SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price FROM ...",
       "decision": "materialize",
       "reason": "same family and same filter, different group by branches"
     }
@@ -1098,9 +1100,10 @@ Agent-only 原型仍保留最低限度检查：
 24. `output_columns` 不能包含 `.`；它只表示 MV 表真实物理列名。
 25. `column_mappings.source_table.source_column` 必须存在于 `tpcds_simple.json`。
 26. `build_sql` 必须显式包含 `AS mv_column`，不能依赖 Spark 自动列名。
-27. RewriteAgent 使用 MV 时不能引用源表限定列名；发现 `` `date_dim.d_year` `` 或 `date_dim.d_year` 这类引用时必须 fallback。
-28. RewriteAgent 必须保持 original SQL 中显式或隐式 alias，以及无 alias 表达式的 Spark 输出名；如果无法证明一致，必须 fallback。
-29. `ExecutorAgent.run_queries(...)` 必须从 rewrite meta 读取 `used_mv_ids` 并写入 execution order；如果 rewrite meta 缺少该字段，代码层直接失败。
+27. `build_sql` 必须使用 `CREATE TABLE ... AS SELECT ...`，不能使用 `CREATE OR REPLACE TABLE`。
+28. RewriteAgent 使用 MV 时不能引用源表限定列名；发现 `` `date_dim.d_year` `` 或 `date_dim.d_year` 这类引用时必须 fallback。
+29. RewriteAgent 必须保持 original SQL 中显式或隐式 alias，以及无 alias 表达式的 Spark 输出名；如果无法证明一致，必须 fallback。
+30. `ExecutorAgent.run_queries(...)` 必须从 rewrite meta 读取 `used_mv_ids` 并写入 execution order；如果 rewrite meta 缺少该字段，代码层直接失败。
 
 ## 9. MVP 流程
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,7 @@ class BatchMVAgent(LLMRulesAgent):
             input_artifacts={**input_artifacts, "candidate_mv_output": candidate_output},
             output_model=BatchMVOutput,
         )
+        self._normalize_materialize_build_sql(output)
         self._validate_output(output, current_batch, families["query_families"], materialized_mvs, batch_id)
 
         mv_candidates_path = self.store.write_json(f"04_batch_mvs/batch_{batch_id}_mv_candidates.json", output)
@@ -203,6 +205,8 @@ class BatchMVAgent(LLMRulesAgent):
             raise ValueError(f"Candidate {candidate_id} output_columns missing column_mappings for {missing_mappings}")
 
         build_sql = candidate.get("build_sql") or ""
+        if not re.match(r"^\s*create\s+table\b", build_sql, flags=re.IGNORECASE):
+            raise ValueError(f"Candidate {candidate_id} build_sql must start with CREATE TABLE")
         lower_build_sql = build_sql.lower()
         for mapping in mappings:
             validate_physical_column(physical_schema, mapping["source_table"], mapping["source_column"])
@@ -212,6 +216,17 @@ class BatchMVAgent(LLMRulesAgent):
             if mapping["role"] != "measure" and mapping["mv_column"] != f"{mapping['source_table']}_{mapping['source_column']}":
                 raise ValueError(
                     f"Candidate {candidate_id} mv_column {mv_column} must use source_table_source_column naming"
+                )
+
+    def _normalize_materialize_build_sql(self, output: dict[str, Any]) -> None:
+        for candidate in output["mv_candidates"]:
+            if candidate["decision"] == "materialize" and candidate.get("build_sql"):
+                candidate["build_sql"] = re.sub(
+                    r"^\s*create\s+or\s+replace\s+table\b",
+                    "CREATE TABLE",
+                    candidate["build_sql"],
+                    count=1,
+                    flags=re.IGNORECASE,
                 )
 
     def _render_build_sql(self, output: dict[str, Any]) -> str:

@@ -306,7 +306,7 @@ def test_executor_agent_dry_run_materializes_available_mvs_and_orders_queries() 
                             "role": "measure",
                         },
                     ],
-                    "build_sql": "CREATE OR REPLACE TABLE mv_ok AS SELECT 1",
+                    "build_sql": "CREATE TABLE mv_ok AS SELECT 1",
                     "decision": "materialize",
                     "reason": "dry-run success",
                 },
@@ -319,14 +319,14 @@ def test_executor_agent_dry_run_materializes_available_mvs_and_orders_queries() 
                     "target_table_name": "mv_missing_dep",
                     "target_queries": ["q52"],
                     "depends_on_mv_ids": ["mv_not_available"],
-                    "build_sql": "CREATE OR REPLACE TABLE mv_missing_dep AS SELECT 1",
+                    "build_sql": "CREATE TABLE mv_missing_dep AS SELECT 1",
                     "decision": "materialize",
                     "reason": "missing dependency",
                 },
             ],
         },
     )
-    build_sql_path = store.write_text("04_batch_mvs/batch_3_mv_build.sql", "CREATE OR REPLACE TABLE mv_ok AS SELECT 1")
+    build_sql_path = store.write_text("04_batch_mvs/batch_3_mv_build.sql", "CREATE TABLE mv_ok AS SELECT 1")
 
     materialized_mvs_path = ExecutorAgent(store).materialize_mvs(3, candidates_path, build_sql_path)
     materialized = store.read_json(materialized_mvs_path)["materialized_mvs"]
@@ -403,7 +403,7 @@ def test_batch_mv_agent_rejects_materialize_candidate_without_column_mappings() 
                 "output_columns": ["date_dim_d_year"],
                 "group_by_exprs": ["date_dim.d_year"],
                 "measure_exprs": [],
-                "build_sql": "CREATE OR REPLACE TABLE mv_missing_mappings AS SELECT date_dim.d_year AS date_dim_d_year FROM date_dim",
+                "build_sql": "CREATE TABLE mv_missing_mappings AS SELECT date_dim.d_year AS date_dim_d_year FROM date_dim",
             }
         ],
     }
@@ -448,7 +448,7 @@ def test_batch_mv_agent_rejects_dotted_mv_output_columns() -> None:
                 ],
                 "group_by_exprs": ["date_dim.d_year"],
                 "measure_exprs": [],
-                "build_sql": "CREATE OR REPLACE TABLE mv_dotted_columns AS SELECT date_dim.d_year AS date_dim_d_year FROM date_dim",
+                "build_sql": "CREATE TABLE mv_dotted_columns AS SELECT date_dim.d_year AS date_dim_d_year FROM date_dim",
             }
         ],
     }
@@ -461,6 +461,57 @@ def test_batch_mv_agent_rejects_dotted_mv_output_columns() -> None:
             families_path,
             historical_rewrite_dir,
         )
+
+
+def test_batch_mv_agent_normalizes_create_or_replace_to_create_table() -> None:
+    store = make_store("test_batch_mv_create_table")
+    batches_path, query_blocks_path, families_path, historical_rewrite_dir = write_minimal_batch_mv_inputs(store, ["q42"])
+    output = {
+        "batch_id": 3,
+        "mv_candidates": [
+            {
+                "candidate_id": "cand_create_table",
+                "source_batch_id": 3,
+                "source_query_ids": ["q42"],
+                "family_id": "family_ss_dd_item",
+                "target_queries": ["q42"],
+                "decision": "materialize",
+                "reason": "test",
+                "mv_id": "mv_create_table",
+                "mv_type": "fine_grain_aggregate",
+                "target_table_name": "mv_create_table",
+                "depends_on_mv_ids": [],
+                "output_columns": ["date_dim_d_year"],
+                "column_mappings": [
+                    {
+                        "source_expr": "date_dim.d_year",
+                        "source_table": "date_dim",
+                        "source_column": "d_year",
+                        "mv_column": "date_dim_d_year",
+                        "role": "dimension",
+                    }
+                ],
+                "group_by_exprs": ["date_dim.d_year"],
+                "measure_exprs": [],
+                "build_sql": "CREATE OR REPLACE TABLE mv_create_table AS SELECT date_dim.d_year AS date_dim_d_year FROM date_dim",
+            }
+        ],
+    }
+
+    mv_candidates_path = BatchMVAgent(store, StaticLLM([output, output])).run(
+        3,
+        batches_path,
+        query_blocks_path,
+        families_path,
+        historical_rewrite_dir,
+    )
+
+    candidate = store.read_json(mv_candidates_path)["mv_candidates"][0]
+    mv_build_sql = store.read_text(store.path("04_batch_mvs/batch_3_mv_build.sql"))
+    assert candidate["build_sql"].startswith("CREATE TABLE mv_create_table")
+    assert "CREATE OR REPLACE TABLE" not in candidate["build_sql"].upper()
+    assert "CREATE TABLE mv_create_table" in mv_build_sql
+    assert "CREATE OR REPLACE TABLE" not in mv_build_sql.upper()
 
 
 def test_rewrite_agent_falls_back_when_mv_rewrite_uses_source_qualified_columns() -> None:
@@ -643,7 +694,9 @@ def test_live_batch_cluster_batch_mv_and_self_iteration_agents_produce_artifacts
     mv_output = store.read_json(mv_candidates_path)
     assert mv_output["batch_id"] == 3
     assert mv_output["mv_candidates"]
-    assert store.path("04_batch_mvs/batch_3_mv_build.sql").exists()
+    mv_build_sql = store.read_text(store.path("04_batch_mvs/batch_3_mv_build.sql"))
+    assert "CREATE OR REPLACE TABLE" not in mv_build_sql.upper()
+    assert "CREATE TABLE" in mv_build_sql.upper()
     assert store.path("04_batch_mvs/materialized_mvs.json").exists()
 
     for candidate in mv_output["mv_candidates"]:
@@ -653,6 +706,8 @@ def test_live_batch_cluster_batch_mv_and_self_iteration_agents_produce_artifacts
         assert set(candidate["target_queries"]).issubset(set(target_batch["query_ids"]))
         assert not any(query_id.startswith("downstream") for query_id in candidate["target_queries"])
         if candidate["decision"] == "materialize":
+            assert candidate["build_sql"].upper().startswith("CREATE TABLE")
+            assert "CREATE OR REPLACE TABLE" not in candidate["build_sql"].upper()
             assert candidate["column_mappings"]
             assert all("." not in column for column in candidate["output_columns"])
             mapped_columns = {mapping["mv_column"] for mapping in candidate["column_mappings"]}
