@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import time
 from pathlib import Path
 from typing import Any
@@ -10,6 +9,10 @@ from llm_demo.src.core.artifact_store import ArtifactStore
 from llm_demo.src.core.llm_client import LLMClient
 from llm_demo.src.core.physical_schema import load_physical_schema, validate_physical_column
 from llm_demo.src.core.schemas import BatchMVOutput
+from llm_demo.src.core.sql_utils import (
+    create_table_select_output_names,
+    normalize_create_table_as_select,
+)
 
 
 class BatchMVAgent(LLMRulesAgent):
@@ -205,13 +208,11 @@ class BatchMVAgent(LLMRulesAgent):
             raise ValueError(f"Candidate {candidate_id} output_columns missing column_mappings for {missing_mappings}")
 
         build_sql = candidate.get("build_sql") or ""
-        if not re.match(r"^\s*create\s+table\b", build_sql, flags=re.IGNORECASE):
-            raise ValueError(f"Candidate {candidate_id} build_sql must start with CREATE TABLE")
-        lower_build_sql = build_sql.lower()
+        build_output_columns = create_table_select_output_names(build_sql)
         for mapping in mappings:
             validate_physical_column(physical_schema, mapping["source_table"], mapping["source_column"])
             mv_column = mapping["mv_column"]
-            if f" as {mv_column.lower()}" not in lower_build_sql:
+            if mv_column.lower() not in build_output_columns:
                 raise ValueError(f"Candidate {candidate_id} build_sql must explicitly alias {mv_column}")
             if mapping["role"] != "measure" and mapping["mv_column"] != f"{mapping['source_table']}_{mapping['source_column']}":
                 raise ValueError(
@@ -221,13 +222,7 @@ class BatchMVAgent(LLMRulesAgent):
     def _normalize_materialize_build_sql(self, output: dict[str, Any]) -> None:
         for candidate in output["mv_candidates"]:
             if candidate["decision"] == "materialize" and candidate.get("build_sql"):
-                candidate["build_sql"] = re.sub(
-                    r"^\s*create\s+or\s+replace\s+table\b",
-                    "CREATE TABLE",
-                    candidate["build_sql"],
-                    count=1,
-                    flags=re.IGNORECASE,
-                )
+                candidate["build_sql"] = normalize_create_table_as_select(candidate["build_sql"])
 
     def _render_build_sql(self, output: dict[str, Any]) -> str:
         statements = []

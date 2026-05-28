@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import time
 from pathlib import Path
 from typing import Any
@@ -9,6 +8,12 @@ from llm_demo.src.core.agent_base import LLMRulesAgent
 from llm_demo.src.core.artifact_store import ArtifactStore
 from llm_demo.src.core.llm_client import LLMClient
 from llm_demo.src.core.schemas import RewriteOutput
+from llm_demo.src.core.sql_utils import (
+    aliased_select_output_names,
+    select_output_names,
+    unaliased_select_output_names,
+    uses_source_qualified_columns,
+)
 
 
 class RewriteAgent(LLMRulesAgent):
@@ -190,110 +195,17 @@ class RewriteAgent(LLMRulesAgent):
             mappings = mv.get("column_mappings", [])
             if not mappings:
                 return "mv_column_mappings_missing"
-            if self._uses_source_qualified_columns(record["rewritten_sql"], mappings):
+            if uses_source_qualified_columns(record["rewritten_sql"], mappings):
                 return "mv_uses_source_qualified_columns"
 
-        required_aliases = self._required_output_aliases(original_sql)
-        if required_aliases and not self._select_clause_contains_aliases(record["rewritten_sql"], required_aliases):
+        rewritten_output_names = select_output_names(record["rewritten_sql"])
+        required_aliases = aliased_select_output_names(original_sql)
+        if not required_aliases.issubset(rewritten_output_names):
             return "output_alias_missing"
-        required_output_names = self._required_unaliased_output_names(original_sql)
-        if required_output_names and not self._select_clause_contains_output_names(record["rewritten_sql"], required_output_names):
+        required_output_names = unaliased_select_output_names(original_sql)
+        if not required_output_names.issubset(rewritten_output_names):
             return "output_name_missing"
         return None
-
-    def _uses_source_qualified_columns(self, rewritten_sql: str, mappings: list[dict[str, Any]]) -> bool:
-        lower_sql = rewritten_sql.lower()
-        if re.search(r"`[^`]*\.[^`]*`", lower_sql):
-            return True
-        for mapping in mappings:
-            source_ref = f"{mapping['source_table']}.{mapping['source_column']}".lower()
-            if source_ref in lower_sql:
-                return True
-        return False
-
-    def _required_output_aliases(self, original_sql: str) -> list[str]:
-        select_clause = self._select_clause(original_sql)
-        aliases: list[str] = []
-        for item in self._split_select_items(select_clause):
-            stripped = item.strip().rstrip(",")
-            explicit = self._explicit_alias(stripped)
-            if explicit:
-                aliases.append(explicit)
-                continue
-            implicit = self._implicit_alias(stripped)
-            if implicit:
-                aliases.append(implicit)
-        return aliases
-
-    def _select_clause_contains_aliases(self, rewritten_sql: str, required_aliases: list[str]) -> bool:
-        return self._select_clause_contains_output_names(rewritten_sql, required_aliases)
-
-    def _required_unaliased_output_names(self, original_sql: str) -> list[str]:
-        select_clause = self._select_clause(original_sql)
-        output_names: list[str] = []
-        for item in self._split_select_items(select_clause):
-            stripped = item.strip().rstrip(",")
-            if self._explicit_alias(stripped) or self._implicit_alias(stripped):
-                continue
-            simple_column = re.fullmatch(r"(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)", stripped)
-            if simple_column:
-                output_names.append(simple_column.group(1))
-            else:
-                output_names.append(stripped)
-        return output_names
-
-    def _select_clause_contains_output_names(self, rewritten_sql: str, output_names: list[str]) -> bool:
-        select_clause = self._select_clause(rewritten_sql)
-        rewritten_items = [self._normalize_sql_text(item) for item in self._split_select_items(select_clause)]
-        return all(self._select_clause_contains_output_name(rewritten_items, output_name) for output_name in output_names)
-
-    def _select_clause_contains_output_name(self, rewritten_items: list[str], output_name: str) -> bool:
-        normalized_name = self._normalize_sql_text(output_name)
-        for item in rewritten_items:
-            if item == normalized_name:
-                return True
-            if re.search(rf"\bas\s+{re.escape(normalized_name)}\s*$", item):
-                return True
-            if re.search(rf"\bas\s+`{re.escape(normalized_name)}`\s*$", item):
-                return True
-            if item.endswith(f" {normalized_name}") or item.endswith(f" `{normalized_name}`"):
-                return True
-        return False
-
-    def _explicit_alias(self, select_item: str) -> str | None:
-        match = re.search(r"\bas\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$", select_item, flags=re.IGNORECASE)
-        return match.group(1) if match else None
-
-    def _implicit_alias(self, select_item: str) -> str | None:
-        match = re.search(r"(.+)\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", select_item)
-        if not match:
-            return None
-        return match.group(2)
-
-    def _normalize_sql_text(self, text: str) -> str:
-        return re.sub(r"\s+", " ", text.strip()).lower()
-
-    def _select_clause(self, sql: str) -> str:
-        match = re.search(r"\bselect\b(.*?)\bfrom\b", sql, flags=re.IGNORECASE | re.DOTALL)
-        return match.group(1) if match else ""
-
-    def _split_select_items(self, select_clause: str) -> list[str]:
-        items: list[str] = []
-        current: list[str] = []
-        depth = 0
-        for char in select_clause:
-            if char == "(":
-                depth += 1
-            elif char == ")" and depth:
-                depth -= 1
-            if char == "," and depth == 0:
-                items.append("".join(current))
-                current = []
-            else:
-                current.append(char)
-        if current:
-            items.append("".join(current))
-        return items
 
     def _convert_to_fallback(self, record: dict[str, Any], query: dict[str, str], reason: str) -> None:
         record["status"] = "fallback"

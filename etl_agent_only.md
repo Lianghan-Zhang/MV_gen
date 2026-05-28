@@ -1,7 +1,7 @@
 # ETL MV Agent-Only 原型实现方案
 
-> 版本：v1.44  
-> 日期：2026-05-28  
+> 版本：v1.45
+> 日期：2026-05-28
 > 目标：在 `llm_demo/` 中先用轻量 Agent 串通 ETL MV 编排流程。除 `SQLLoaderAgent` 和 `ExecutorAgent` 外，其余 Agent 均采用 `LLM + rules` 实现。第一版优先验证流程闭环，后续再逐步替换为确定性算法实现。
 
 ## 0. 定位
@@ -72,6 +72,7 @@ SQLLoaderAgent(code)
 46. RewriteAgent 使用 MV 时只能引用 MV 物理列名；如果 rewritten SQL 仍引用源表限定列名，或丢失 original SQL 的输出列名，必须 fallback。
 47. `ExecutorAgent.run_queries(...)` 输出的 execution order 中，`run_query.depends_on_mv_ids` 必须来自对应 rewrite meta 的 `used_mv_ids`。
 48. `BatchMVAgent` 的 `build_sql` 统一使用 `CREATE TABLE ... AS SELECT ...`；不生成 `CREATE OR REPLACE TABLE`，避免原型 dry-run / 后续 Spark 执行阶段引入覆盖已有表的语义。
+49. 代码层凡涉及 SQL 解析、SELECT 输出列名提取、CTAS 规范化、源表限定列检测等 SQL 操作，统一使用 SQLGlot；不使用正则表达式解析、判断或改写 SQL。
 
 ## 1. 工作目录
 
@@ -108,6 +109,7 @@ llm_demo/
 │   │   ├── llm_client.py
 │   │   ├── artifact_store.py
 │   │   ├── physical_schema.py
+│   │   ├── sql_utils.py
 │   │   └── schemas.py
 │   └── agents/
 │       ├── sql_loader_agent.py
@@ -157,6 +159,20 @@ LLM_MAX_RETRIES=2
 2. 不在 `llm_client.py`、notebook、rules、artifact 中硬编码 API key。
 3. `llm_demo/src/core/llm_client.py` 只负责从环境变量读取配置，并提供 `infer(prompt, load_json=True)`。
 4. 如果环境变量缺失，启动时直接报错，不进入 LLM 调用。
+
+第一版最小依赖建议包含：
+
+```text
+pytest
+pydantic
+openai
+python-dotenv
+PyYAML
+nbformat
+sqlglot
+```
+
+其中 `sqlglot` 用于代码层 SQL AST 操作，例如 CTAS 解析、SELECT 输出列名识别和 rewrite 安全检查。
 
 ## 3. Agent 实现方式
 
@@ -1053,6 +1069,7 @@ LLM 调用
 JSON schema 校验
 artifact 落盘
 SQL 文件保存
+SQLGlot AST 解析与 SQL 安全校验
 materialized_mvs 状态维护
 Executor dry-run / Spark 执行
 错误日志记录
@@ -1104,6 +1121,7 @@ Agent-only 原型仍保留最低限度检查：
 28. RewriteAgent 使用 MV 时不能引用源表限定列名；发现 `` `date_dim.d_year` `` 或 `date_dim.d_year` 这类引用时必须 fallback。
 29. RewriteAgent 必须保持 original SQL 中显式或隐式 alias，以及无 alias 表达式的 Spark 输出名；如果无法证明一致，必须 fallback。
 30. `ExecutorAgent.run_queries(...)` 必须从 rewrite meta 读取 `used_mv_ids` 并写入 execution order；如果 rewrite meta 缺少该字段，代码层直接失败。
+31. 代码层 SQL 操作必须通过 SQLGlot AST 完成；不得用正则表达式解析 SELECT 子句、判断列引用、规范化 CTAS 或改写 SQL。
 
 ## 9. MVP 流程
 
@@ -1231,6 +1249,7 @@ src/core/agent_base.py
 src/core/llm_client.py
 src/core/artifact_store.py
 src/core/physical_schema.py
+src/core/sql_utils.py
 src/core/schemas.py
 src/agents/sql_loader_agent.py
 src/agents/feature_agent.py
