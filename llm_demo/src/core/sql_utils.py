@@ -59,6 +59,51 @@ def uses_source_qualified_columns(sql: str, mappings: list[dict[str, Any]]) -> b
     return False
 
 
+def aggregate_measure_column_name(source_expr: str, source_column: str) -> str:
+    expression = _parse_sql(source_expr)
+    if not isinstance(expression, exp.AggFunc):
+        raise ValueError(f"Measure source_expr must be an aggregate expression: {source_expr}")
+    return f"{expression.key.lower()}_{source_column.lower()}"
+
+
+def unknown_column_names(sql: str, allowed_columns: set[str]) -> set[str]:
+    expression = _parse_sql(sql)
+    allowed = {column.lower() for column in allowed_columns}
+    allowed.update(select_output_names(sql))
+    unknown = set()
+    for column in expression.find_all(exp.Column):
+        column_name = column.name.lower()
+        if column_name not in allowed:
+            unknown.add(column_name)
+    return unknown
+
+
+def order_limit_mismatch_reason(original_sql: str, rewritten_sql: str) -> str | None:
+    original = _parse_select(original_sql)
+    rewritten = _parse_select(rewritten_sql)
+
+    original_order = original.args.get("order")
+    rewritten_order = rewritten.args.get("order")
+    if original_order:
+        if not rewritten_order:
+            return "order_by_missing"
+        if len(original_order.expressions) != len(rewritten_order.expressions):
+            return "order_by_mismatch"
+        for original_item, rewritten_item in zip(original_order.expressions, rewritten_order.expressions):
+            if bool(original_item.args.get("desc")) != bool(rewritten_item.args.get("desc")):
+                return "order_by_mismatch"
+
+    original_limit = original.args.get("limit")
+    rewritten_limit = rewritten.args.get("limit")
+    if original_limit:
+        if not rewritten_limit:
+            return "limit_missing"
+        if _limit_value(original_limit) != _limit_value(rewritten_limit):
+            return "limit_mismatch"
+
+    return None
+
+
 def _parse_create(sql: str) -> exp.Create:
     expression = _parse_sql(sql)
     if not isinstance(expression, exp.Create) or expression.args.get("kind") != "TABLE":
@@ -92,3 +137,10 @@ def _select_outputs(select: exp.Select) -> list[SelectOutput]:
         else:
             outputs.append(SelectOutput(name=expression.sql(dialect=SQL_DIALECT).lower(), aliased=False))
     return outputs
+
+
+def _limit_value(limit: exp.Limit) -> str:
+    expression = limit.args.get("expression")
+    if expression is None:
+        return ""
+    return expression.sql(dialect=SQL_DIALECT).lower()

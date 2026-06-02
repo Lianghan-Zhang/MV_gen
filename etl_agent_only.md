@@ -1,7 +1,7 @@
 # ETL MV Agent-Only 原型实现方案
 
-> 版本：v1.45
-> 日期：2026-05-28
+> 版本：v1.51
+> 日期：2026-05-30
 > 目标：在 `llm_demo/` 中先用轻量 Agent 串通 ETL MV 编排流程。除 `SQLLoaderAgent` 和 `ExecutorAgent` 外，其余 Agent 均采用 `LLM + rules` 实现。第一版优先验证流程闭环，后续再逐步替换为确定性算法实现。
 
 ## 0. 定位
@@ -56,23 +56,30 @@ SQLLoaderAgent(code)
 30. 一个 SQL 的全局 batch 由其所有 QueryBlock 中最高复杂度决定。
 31. 如果一个 SQL 的多个 QueryBlock 属于不同 family，该 `query_id` 可以出现在同一 global batch 的多个 `family_groups` 中，但顶层 `query_ids` 必须去重，最终执行和 final rewrite 只能发生一次。
 32. `BatchMVAgent` 不允许跨 family 合并生成一个 MV Candidate；如果两个结构确实可共享 MV，应先由 `FamilyAgent` 的 evaluate 阶段合并或修正 QueryFamily。
-33. `FamilyAgent` 的 family 合并采用 predicate 兼容标准：join skeleton 相同或可证明等价、过滤列结构同构但常量值不同的 QueryBlock 可以进入同一 family。
-34. `QueryFamily.common_predicates` 只记录 family 内完全相同的谓词；同构过滤列但常量值不同的谓词用 `predicate_shapes` 表达。
-35. `BatchMVAgent` 默认构造 shared upstream superset MV：MV 不要求是某条 workflow SQL 的子集，而是使多个 workflow SQL 能通过 filter / projection / aggregate / roll-up 从 MV 重写得到。
-36. `BatchMVAgent` 先判断 shared upstream superset MV 的语义边界，再决定物理形态；若可证明聚合后仍支持所有 target Query，优先生成 fine-grain aggregate MV，否则 fallback 到 detail superset MV，仍无法安全 rewrite 时 skip。
-37. superset MV 只把 target Query 共同拥有的 predicate shape 放入 MV predicate，并且泛化范围只能来自当前 batch 已出现的常量集合；非共同 predicate 不进入 MV predicate，而是记录为下游 residual filter。
-38. RewriteAgent 永远不覆盖 original SQL；每个 rewrite 阶段、每条 SQL 都必须输出 `{query_id}_rewritten.sql`、对应 `{query_id}_rewrite_meta.json`，并追加 run log。
-39. 即使没有安全可用的 MV，RewriteAgent 也必须生成 original-equivalent 的 rewritten SQL，后续阶段统一从 rewritten SQL 产物读取。
-40. `BatchMVAgent` 采用两次 LLM + rules 调用：第一次生成 `candidate_mv_output`，第二次 evaluate 并修正为最终 MV Candidate 输出。
-41. `BatchMVAgent` 的 evaluate 阶段不新增核心数据结构；它只校验并修正 MV Candidate 是否满足当前 batch、family 边界、shared upstream superset、依赖 DAG 和 rewrite 安全约束。
-42. `BatchMVAgent` 输出的 `output_columns` 必须是 MV 表的真实物理列名，不能写 `date_dim.d_year` 这类源表限定列名。
-43. 源字段身份通过 MV Candidate / Materialized View State 内的 `column_mappings` 保存，例如 `date_dim.d_year -> date_dim_d_year`；这是 MV 元数据字段，不是新的独立核心业务结构。
-44. `build_sql` 必须显式为每个输出表达式设置稳定别名，例如 `date_dim.d_year AS date_dim_d_year`、`item.i_brand_id AS item_i_brand_id`。
-45. `tpcds_simple.json` 只作为物理表字段白名单，用于校验 `source_table.source_column` 是否存在；不生成新的 artifact，不做 SQL 自动修复。
-46. RewriteAgent 使用 MV 时只能引用 MV 物理列名；如果 rewritten SQL 仍引用源表限定列名，或丢失 original SQL 的输出列名，必须 fallback。
-47. `ExecutorAgent.run_queries(...)` 输出的 execution order 中，`run_query.depends_on_mv_ids` 必须来自对应 rewrite meta 的 `used_mv_ids`。
-48. `BatchMVAgent` 的 `build_sql` 统一使用 `CREATE TABLE ... AS SELECT ...`；不生成 `CREATE OR REPLACE TABLE`，避免原型 dry-run / 后续 Spark 执行阶段引入覆盖已有表的语义。
-49. 代码层凡涉及 SQL 解析、SELECT 输出列名提取、CTAS 规范化、源表限定列检测等 SQL 操作，统一使用 SQLGlot；不使用正则表达式解析、判断或改写 SQL。
+33. `QueryFamily` 不是简单 SQL 相似簇，而是一组可由同一个 upstream join-domain MV 或 shared superset MV 覆盖的 QueryBlock。
+34. `FamilyAgent` 使用 Jaccard 衡量表集合相似度，使用 Containment 识别 ETL 宽表覆盖关系；二者只负责生成 family candidate，不直接决定最终合并。候选分层为：`strong` = `Jaccard = 1.0` 或 `Containment = 1.0` 且 core fact table 相同；`medium` = `Jaccard >= 0.6` 且 core fact table 相同，或 `Containment >= 0.8` 且较小 QueryBlock 的表集合主要被较大 join domain 覆盖；其余默认保持分离。
+35. core fact table 是 QueryBlock join domain 中承载业务事实、度量或高基数交易记录的中心表，例如 TPC-DS 中的 `store_sales`、`catalog_sales`、`web_sales`、`store_returns`、`catalog_returns`、`web_returns`、`inventory`。第一版把 core fact table 相同作为 family 合并 hard gate；如果 core fact table 不同，即使 Jaccard / Containment 较高，也默认不合并。
+36. 多 fact table QueryBlock 第一版只和具有完全相同 core fact table set 且 join graph 可证明不会引入行数膨胀的 QueryBlock 合并；否则保持为独立 family 或 `other`，避免宽表 MV 把不同事实语义错误混合。
+37. `FamilyAgent` 的最终合并必须通过 core fact table、join graph、predicate shape、measure compatibility 和 roll-up safety 检查；join skeleton 相同或可证明等价、过滤列结构同构但常量值不同的 QueryBlock 可以进入同一 family。
+38. predicate shape 兼容只覆盖两类第一版允许场景：同一过滤列常量不同；或者一方比另一方多出过滤条件，且多出的过滤列可在 MV 中保留为 residual filter 所需列。若过滤列集合完全不同，第一版必须拆成不同 family。
+39. `QueryFamily.common_predicates` 只记录 family 内完全相同的谓词；同构过滤列但常量值不同的谓词用 `predicate_shapes` 表达。
+40. `BatchMVAgent` 默认构造 shared upstream superset MV：MV 不要求是某条 workflow SQL 的子集，而是使多个 workflow SQL 能通过 filter / projection / aggregate / roll-up 从 MV 重写得到。
+41. `BatchMVAgent` 先判断 shared upstream superset MV 的语义边界，再决定物理形态；若可证明聚合后仍支持所有 target Query，优先生成 fine-grain aggregate MV，否则 fallback 到 detail superset MV，仍无法安全 rewrite 时 skip。
+42. superset MV 只把 target Query 共同拥有的 predicate shape 放入 MV predicate，并且泛化范围只能来自当前 batch 已出现的常量集合；非共同 predicate 不进入 MV predicate，而是记录为下游 residual filter。
+43. RewriteAgent 永远不覆盖 original SQL；每个 rewrite 阶段、每条 SQL 都必须输出 `{query_id}_rewritten.sql`、对应 `{query_id}_rewrite_meta.json`，并追加 run log。
+44. 即使没有安全可用的 MV，RewriteAgent 也必须生成 original-equivalent 的 rewritten SQL，后续阶段统一从 rewritten SQL 产物读取。
+45. `BatchMVAgent` 采用两次 LLM + rules 调用：第一次生成 `candidate_mv_output`，第二次 evaluate 并修正为最终 MV Candidate 输出。
+46. `BatchMVAgent` 的 evaluate 阶段不新增核心数据结构；它只校验并修正 MV Candidate 是否满足当前 batch、family 边界、shared upstream superset、依赖 DAG 和 rewrite 安全约束。
+47. `BatchMVAgent` 输出的 `output_columns` 必须是 MV 表的真实物理列名，不能写 `date_dim.d_year` 这类源表限定列名。
+48. 源字段身份通过 MV Candidate / Materialized View State 内的 `column_mappings` 保存，例如 `date_dim.d_year -> d_year`；这是 MV 元数据字段，不是新的独立核心业务结构。
+49. 普通物理列默认不写 `AS`，`mv_column` 使用源字段名；只有聚合表达式和普通列同名冲突时才显式 `AS mv_column`。
+50. `tpcds_simple.json` 只作为物理表字段白名单，用于校验 `source_table.source_column` 是否存在；不生成新的 artifact，不做 SQL 自动修复。
+51. RewriteAgent 使用 MV 时只能引用 MV 物理列名；如果 rewritten SQL 仍引用源表限定列名，或丢失 original SQL 的输出列名，必须 fallback。
+52. `ExecutorAgent.run_queries(...)` 输出的 execution order 中，`run_query.depends_on_mv_ids` 必须来自对应 rewrite meta 的 `used_mv_ids`。
+53. `BatchMVAgent` 的 `build_sql` 统一使用 `CREATE TABLE ... AS SELECT ...`；不生成 `CREATE OR REPLACE TABLE`，避免原型 dry-run / 后续 Spark 执行阶段引入覆盖已有表的语义。
+54. 代码层凡涉及 SQL 解析、SELECT 输出列名提取、CTAS 规范化、源表限定列检测等 SQL 操作，统一使用 SQLGlot；不使用正则表达式解析、判断或改写 SQL。
+55. measure 类型的 MV 物理列名统一使用 `{agg_func}_{source_column}`，例如 `SUM(store_sales.ss_ext_sales_price)` 输出 `sum_ss_ext_sales_price`，保留源字段 `ss_ext_sales_price` 的业务前缀。
+56. final rewrite 必须保留 original SQL 的 `ORDER BY` 和 `LIMIT`；如果 LLM 输出遗漏，RewriteAgent 最多重试 2 次，仍无法修正则 fallback。
 
 ## 1. 工作目录
 
@@ -271,40 +278,40 @@ run_log
       "target_queries": ["q42", "q52"],
       "depends_on_mv_ids": ["mv_batch_1_example"],
       "group_by_exprs": ["date_dim.d_year", "date_dim.d_moy", "item.i_manager_id"],
-      "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price"],
+      "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ss_ext_sales_price"],
       "output_columns": [
-        "date_dim_d_year",
-        "date_dim_d_moy",
-        "item_i_manager_id",
-        "sum_ext_sales_price"
+        "d_year",
+        "d_moy",
+        "i_manager_id",
+        "sum_ss_ext_sales_price"
       ],
       "column_mappings": [
         {
           "source_expr": "date_dim.d_year",
           "source_table": "date_dim",
           "source_column": "d_year",
-          "mv_column": "date_dim_d_year",
+          "mv_column": "d_year",
           "role": "dimension"
         },
         {
           "source_expr": "date_dim.d_moy",
           "source_table": "date_dim",
           "source_column": "d_moy",
-          "mv_column": "date_dim_d_moy",
+          "mv_column": "d_moy",
           "role": "filter"
         },
         {
           "source_expr": "item.i_manager_id",
           "source_table": "item",
           "source_column": "i_manager_id",
-          "mv_column": "item_i_manager_id",
+          "mv_column": "i_manager_id",
           "role": "filter"
         },
         {
           "source_expr": "SUM(store_sales.ss_ext_sales_price)",
           "source_table": "store_sales",
           "source_column": "ss_ext_sales_price",
-          "mv_column": "sum_ext_sales_price",
+          "mv_column": "sum_ss_ext_sales_price",
           "role": "measure"
         }
       ],
@@ -528,7 +535,7 @@ for batch in complexity_batches:
      2.2 基于相同输入 + candidate_mv_output 执行 evaluate，修正当前 batch 边界、family 边界、mv_type、predicate / residual_filter、depends_on_mv_ids、column_mappings、build_sql 和 decision
      可只读参考完整的 query_families.json 与 complexity_batches.json 判断后续复用价值
      如果 build SQL 依赖历史 MV，必须记录 depends_on_mv_ids
-     如果 decision = materialize，output_columns 必须是 MV 物理列名，build SQL 必须显式 AS mv_column
+     如果 decision = materialize，output_columns 必须是 MV 物理列名；普通物理列默认不 AS，聚合表达式必须显式 AS measure mv_column
      使用 tpcds_simple.json 校验 column_mappings 中的 source_table.source_column 是否存在
      即使 used_mv_ids = []，也应继续尝试生成当前 batch 的 MV Candidate
      对外落盘的 batch_{batch_id}_mv_candidates.json 使用 evaluate 后的最终结果
@@ -588,6 +595,31 @@ historical MV rewrite
 7. evaluate 阶段检查输出中是否仍有 SQL alias 或未知表名前缀；SQL alias 应修正为物理表名，未知表名前缀写入 `unsupported_reasons`，不做复杂代码兜底。
 8. 不确定时标记 `unsupported_reasons`，不要编造字段。
 
+示例 `build_sql`：
+
+```sql
+CREATE TABLE mv_ss_dd_item_q42_q52_fg AS
+SELECT
+  date_dim.d_year,
+  item.i_category_id,
+  item.i_category,
+  item.i_brand,
+  item.i_brand_id,
+  SUM(store_sales.ss_ext_sales_price) AS sum_ss_ext_sales_price
+FROM date_dim
+JOIN store_sales ON date_dim.d_date_sk = store_sales.ss_sold_date_sk
+JOIN item ON store_sales.ss_item_sk = item.i_item_sk
+WHERE item.i_manager_id = 1
+  AND date_dim.d_moy = 11
+  AND date_dim.d_year IN (2000)
+GROUP BY
+  date_dim.d_year,
+  item.i_category_id,
+  item.i_category,
+  item.i_brand,
+  item.i_brand_id
+```
+
 输出 JSON：
 
 ```json
@@ -621,24 +653,36 @@ historical MV rewrite
 职责：
 
 ```text
-给定 QueryBlock 列表，按 family_key / join skeleton 聚合 QueryFamily。
+给定 QueryBlock 列表，按 upstream join-domain MV / shared superset MV 覆盖关系聚合 QueryFamily。
 ```
 
 规则重点：
 
 1. 聚合单位是 `qb_id`。
-2. 第一版优先 exact family，不做激进模糊合并。
-3. family 中记录 common tables、common join skeleton、common predicates、predicate shapes、group by 分叉和 measure 并集。
-4. 如果合并依据不足，保持分离。
-5. `FamilyAgent` 采用两次 LLM 调用：第一次生成 `candidate_query_families`，第二次 evaluate 并修正输出。
-6. evaluate 阶段输入为 QueryBlock 列表和 `candidate_query_families`，输出仍是修正后的完整 QueryFamily。
-7. evaluate 阶段重点检查是否存在重复 family、可合并 family、family_key 与 join skeleton 不一致、成员 QueryBlock 归属错误、common 字段错误等问题。
-8. family 合并采用 predicate 兼容标准，而不是要求 predicate 完全相同。
-9. 如果两个 family 的 QueryBlock 具有相同或可证明等价的 join skeleton、同构过滤列结构但常量值不同、兼容 measure，并且后续可共享 MV，应在 evaluate 阶段合并为同一个 family。
-10. `common_predicates` 只记录 family 内完全相同的完整谓词，例如所有成员都有 `item.i_manager_id = 1`。
-11. `predicate_shapes` 记录同构过滤列但常量值可能不同的谓词形状，例如 `date_dim.d_year = <CONST>`、`date_dim.d_moy = <CONST>`。
-12. `predicate_shapes` 中的字段名必须使用物理表名，不使用 SQL alias。
-13. 如果过滤列集合差异过大、predicate 语义不清或 family 是否可合并无法证明，保持分离，并在后续 SelfIterationAgent 的反馈中记录规则改进建议，而不是在 BatchMVAgent 中跨 family 生成 MV。
+2. `QueryFamily` 表示一组可由同一个 upstream join-domain MV 或 shared superset MV 覆盖的 QueryBlock，不是简单 SQL 相似簇。
+3. 第一版优先保守合并，不做激进模糊合并；错误合并会影响 MV rewrite 安全，漏合并只影响优化机会。
+4. family 中记录 common tables、common join skeleton、common predicates、predicate shapes、group by 分叉和 measure 并集。
+5. 如果合并依据不足，保持分离。
+6. `FamilyAgent` 采用两次 LLM 调用：第一次生成 `candidate_query_families`，第二次 evaluate 并修正输出。
+7. evaluate 阶段输入为 QueryBlock 列表和 `candidate_query_families`，输出仍是修正后的完整 QueryFamily。
+8. evaluate 阶段重点检查是否存在重复 family、可合并 family、family_key 与 join skeleton 不一致、成员 QueryBlock 归属错误、common 字段错误等问题。
+9. family candidate 第一层使用表集合量化：`Jaccard(A,B)=|T(A)∩T(B)|/|T(A)∪T(B)|` 衡量相似度，`Containment(A,B)=|T(A)∩T(B)|/min(|T(A)|,|T(B)|)` 识别宽表覆盖关系。
+10. core fact table 是 QueryBlock join domain 中承载事实记录或主要 measure 来源的中心表；TPC-DS 第一版可优先识别 `store_sales`、`catalog_sales`、`web_sales`、`store_returns`、`catalog_returns`、`web_returns`、`inventory`。
+11. candidate 分层规则：`strong candidate` = `Jaccard = 1.0`，或 `Containment = 1.0` 且 core fact table 相同；`medium candidate` = `Jaccard >= 0.6` 且 core fact table 相同，或 `Containment >= 0.8` 且较小 QueryBlock 的表集合主要被较大 join domain 覆盖；低于该阈值默认保持分离。
+12. core fact table 相同是 family 合并 hard gate；如果 core fact table 不同，即使 Jaccard / Containment 较高，也默认保持分离。
+13. 多 fact table QueryBlock 只允许与具有完全相同 core fact table set、且 join graph 可证明不会引入行数膨胀的 QueryBlock 合并；否则单独成 family。
+14. Jaccard 和 Containment 只负责生成 candidate，不直接决定最终合并。
+15. family 最终合并采用安全门：core fact table、join graph、predicate shape、measure compatibility 和 roll-up safety 必须可证明兼容。
+16. family 合并采用 predicate 兼容标准，而不是要求 predicate 完全相同。
+17. 第一版 predicate shape 兼容只允许两类情况：同一过滤列常量不同，例如 `date_dim.d_year = 2000` 与 `date_dim.d_year = 2001`；或者一方比另一方多出过滤条件，且多出的过滤列可在 MV 中保留并作为下游 residual filter。
+18. 如果两个 QueryBlock 的过滤列集合完全不同，例如一个只过滤 `date_dim.d_year`，另一个只过滤 `item.i_manager_id`，即使 core fact table、join graph 和 measure 兼容，也必须拆成不同 family。
+19. 如果两个 family 的 QueryBlock 具有相同或可证明等价的 join skeleton、同构过滤列结构但常量值不同、兼容 measure，并且后续可共享 MV，应在 evaluate 阶段合并为同一个 family。
+20. `common_predicates` 只记录 family 内完全相同的完整谓词，例如所有成员都有 `item.i_manager_id = 1`。
+21. `predicate_shapes` 记录同构过滤列但常量值可能不同的谓词形状，例如 `date_dim.d_year = <CONST>`、`date_dim.d_moy = <CONST>`。
+22. `predicate_shapes` 中的字段名必须使用物理表名，不使用 SQL alias。
+23. 如果过滤列集合差异过大、predicate 语义不清或 family 是否可合并无法证明，保持分离，并在后续 SelfIterationAgent 的反馈中记录规则改进建议，而不是在 BatchMVAgent 中跨 family 生成 MV。
+
+以 q42 / q52 为例，二者的表集合均为 `{date_dim, store_sales, item}`，`Jaccard = 1.0`，`Containment = 1.0`，core fact table 均为 `store_sales`，join graph、predicate shape 和 measure 均兼容，因此可以归入同一 `QueryFamily`。如果另一个 QueryBlock 使用 `web_sales` 作为事实表，即使也连接 `date_dim` 和 `item`，第一版也不与 `store_sales` family 合并。
 
 输出 JSON：
 
@@ -782,10 +826,10 @@ historical MV rewrite
 40. 如果共享 MV 使用了有限泛化 predicate，必须在 Candidate 中记录 `generalized_predicates`，说明每个 predicate shape 覆盖的当前 batch 常量范围。
 41. 额外拆分更窄的专用 MV 可以作为后续 cost-based 扩展；第一版的默认主规则是 shared upstream superset MV，而不是为每个 predicate 差异都生成多个 Candidate。
 42. `BatchMVAgent` 必须采用 generate + evaluate 两阶段；第一阶段生成 `candidate_mv_output`，第二阶段输入相同上下文和 `candidate_mv_output`，输出修正后的完整结果。
-43. `output_columns` 必须是 MV 表的真实物理列名，例如 `date_dim_d_year`、`item_i_brand_id`，不能写 `date_dim.d_year` 这类源表限定列名。
+43. `output_columns` 必须是 MV 表的真实物理列名，例如 `d_year`、`i_brand_id`，不能写 `date_dim.d_year` 这类源表限定列名。
 44. `column_mappings` 记录源字段到 MV 物理列的映射，最小字段包括 `source_expr`、`source_table`、`source_column`、`mv_column` 和 `role`。
-45. 对直接来自物理表字段的 dimension / filter / projection 列，`mv_column` 使用 `{source_table}_{source_column}`；measure 列使用稳定聚合别名，例如 `sum_ext_sales_price`。
-46. `build_sql` 中每个输出表达式必须显式 `AS mv_column`，例如 `date_dim.d_year AS date_dim_d_year`。
+45. 对直接来自物理表字段的 dimension / filter / projection 列，`mv_column` 默认使用 `source_column`；如果同一个 MV 中出现同名物理列冲突，才使用 `{source_table}_{source_column}` 消歧。
+46. measure 列使用 `{agg_func}_{source_column}`，例如 `sum_ss_ext_sales_price`；`build_sql` 中普通物理列默认不写 `AS`，聚合表达式必须显式 `AS measure_mv_column`。
 47. `column_mappings.source_table.source_column` 必须能在 `tpcds_simple.json` 中找到；代码层只校验，不自动修复 SQL。
 48. `build_sql` 必须使用 `CREATE TABLE ... AS SELECT ...`，不要使用 `CREATE OR REPLACE TABLE`。
 49. evaluate 阶段必须检查：`source_batch_id` 是否等于当前 batch，`source_query_ids` / `target_queries` 是否都属于当前 batch，`family_id` 是否唯一且不跨 family，`mv_type` 是否与可证明 rewrite 关系一致，`mv_predicates` / `generalized_predicates` / `residual_filters` 是否满足 shared upstream superset 规则，`output_columns` / `column_mappings` / `group_by_exprs` / `measure_exprs` 是否保留 residual filter、projection 和 roll-up 所需信息，`depends_on_mv_ids` 是否只引用可见历史 MV 且不形成循环，`build_sql` 是否与 Candidate spec 对齐。
@@ -836,84 +880,66 @@ historical MV rewrite
         }
       ],
       "output_columns": [
-        "date_dim_d_year",
-        "date_dim_d_moy",
-        "item_i_manager_id",
-        "item_i_brand_id",
-        "item_i_brand",
-        "item_i_category_id",
-        "item_i_category",
-        "sum_ext_sales_price"
+        "d_year",
+        "i_brand_id",
+        "i_brand",
+        "i_category_id",
+        "i_category",
+        "sum_ss_ext_sales_price"
       ],
       "column_mappings": [
         {
           "source_expr": "date_dim.d_year",
           "source_table": "date_dim",
           "source_column": "d_year",
-          "mv_column": "date_dim_d_year",
+          "mv_column": "d_year",
           "role": "dimension"
-        },
-        {
-          "source_expr": "date_dim.d_moy",
-          "source_table": "date_dim",
-          "source_column": "d_moy",
-          "mv_column": "date_dim_d_moy",
-          "role": "filter"
-        },
-        {
-          "source_expr": "item.i_manager_id",
-          "source_table": "item",
-          "source_column": "i_manager_id",
-          "mv_column": "item_i_manager_id",
-          "role": "filter"
         },
         {
           "source_expr": "item.i_brand_id",
           "source_table": "item",
           "source_column": "i_brand_id",
-          "mv_column": "item_i_brand_id",
+          "mv_column": "i_brand_id",
           "role": "dimension"
         },
         {
           "source_expr": "item.i_brand",
           "source_table": "item",
           "source_column": "i_brand",
-          "mv_column": "item_i_brand",
+          "mv_column": "i_brand",
           "role": "dimension"
         },
         {
           "source_expr": "item.i_category_id",
           "source_table": "item",
           "source_column": "i_category_id",
-          "mv_column": "item_i_category_id",
+          "mv_column": "i_category_id",
           "role": "dimension"
         },
         {
           "source_expr": "item.i_category",
           "source_table": "item",
           "source_column": "i_category",
-          "mv_column": "item_i_category",
+          "mv_column": "i_category",
           "role": "dimension"
         },
         {
           "source_expr": "SUM(store_sales.ss_ext_sales_price)",
           "source_table": "store_sales",
           "source_column": "ss_ext_sales_price",
-          "mv_column": "sum_ext_sales_price",
+          "mv_column": "sum_ss_ext_sales_price",
           "role": "measure"
         }
       ],
       "group_by_exprs": [
         "date_dim.d_year",
-        "date_dim.d_moy",
-        "item.i_manager_id",
         "item.i_brand_id",
         "item.i_brand",
         "item.i_category_id",
         "item.i_category"
       ],
-      "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price"],
-      "build_sql": "CREATE TABLE mv_ss_dd_item_mgr1_y2000_m11_fg AS SELECT date_dim.d_year AS date_dim_d_year, date_dim.d_moy AS date_dim_d_moy, item.i_manager_id AS item_i_manager_id, item.i_brand_id AS item_i_brand_id, item.i_brand AS item_i_brand, item.i_category_id AS item_i_category_id, item.i_category AS item_i_category, SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price FROM ...",
+      "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ss_ext_sales_price"],
+      "build_sql": "CREATE TABLE mv_ss_dd_item_mgr1_y2000_m11_fg AS SELECT date_dim.d_year, item.i_brand_id, item.i_brand, item.i_category_id, item.i_category, SUM(store_sales.ss_ext_sales_price) AS sum_ss_ext_sales_price FROM ...",
       "decision": "materialize",
       "reason": "same family and same filter, different group by branches"
     }
@@ -946,14 +972,16 @@ historical MV rewrite
 13. fallback 时 `status = "fallback"`，`used_mv_ids = []`，`fallback_reason` 必须非空。
 14. 成功使用 MV 时 `status = "rewritten"`，`used_mv_ids` 必须非空，`fallback_reason = null`。
 15. final rewrite 没有可安全使用 MV 时，也必须 fallback original-equivalent SQL，并按原因填写 `fallback_reason`。
-16. 常见 fallback reason 包括：`no_available_historical_mv`、`no_matching_mv`、`mv_columns_not_covering_query`、`mv_column_mappings_missing`、`mv_uses_source_qualified_columns`、`output_alias_missing`、`output_name_missing`、`filter_not_implied_by_mv`、`group_by_not_compatible`、`aggregate_not_supported`、`unsupported_sql_pattern`、`semantic_equivalence_uncertain`。
+16. 常见 fallback reason 包括：`no_available_historical_mv`、`no_matching_mv`、`mv_columns_not_covering_query`、`mv_column_mappings_missing`、`mv_uses_source_qualified_columns`、`mv_unknown_column`、`output_alias_missing`、`output_name_missing`、`order_by_missing`、`order_by_mismatch`、`limit_missing`、`limit_mismatch`、`filter_not_implied_by_mv`、`group_by_not_compatible`、`aggregate_not_supported`、`unsupported_sql_pattern`、`semantic_equivalence_uncertain`。
 17. 第一版支持 SUM / COUNT / AVG / MIN / MAX。
 18. 对复杂 window、rollup、count distinct、stddev、相关子查询默认 fallback。
 19. 使用 MV rewrite 时，只能引用 `materialized_mvs.json` 中的 `output_columns` 或 `column_mappings.mv_column`。
 20. rewritten SQL 不能从 MV 表中引用 `date_dim.d_year`、`` `date_dim.d_year` ``、`item.i_brand_id` 这类源表限定列名；源字段身份只用于规则判断和日志解释。
 21. rewritten SQL 必须保留 original SQL 的输出列名。显式或隐式 alias 必须保留，例如 q52 中的 `brand_id`、`brand`、`ext_price`。
-22. original SQL 中没有 alias 的表达式也必须保留 Spark 输出名。例如 q42 的 `sum(ss_ext_sales_price)` 没有 alias，rewrite 时应输出 `AS \`sum(ss_ext_sales_price)\``，不能改成 `AS sum_ext_sales_price`。
-23. 如果无法证明输出列名一致，必须 fallback 到 original-equivalent SQL。
+22. original SQL 中没有 alias 的表达式也必须保留 Spark 输出名。例如 q42 的 `sum(ss_ext_sales_price)` 没有 alias，rewrite 时应输出 `AS \`sum(ss_ext_sales_price)\``，不能改成 `AS sum_ss_ext_sales_price`。
+23. final rewrite 必须保留 original SQL 的 `ORDER BY` 和 `LIMIT`；如果 original SQL 有排序或 limit，rewritten SQL 也必须保留对应排序项数量、排序方向和 limit 值。
+24. 如果 final rewrite 没有保留 `ORDER BY` / `LIMIT`，RewriteAgent 最多重试 2 次；仍无法修正时 fallback 到 original-equivalent SQL。
+25. 如果无法证明输出列名、排序或 limit 一致，必须 fallback 到 original-equivalent SQL。
 
 输出 JSON：
 
@@ -969,9 +997,9 @@ historical MV rewrite
       "rewritten_sql_path": "{run_id}/05_rewritten_sql/batch_3/final_rewrite/q42_rewritten.sql",
       "rewrite_meta_path": "{run_id}/05_rewritten_sql/batch_3/final_rewrite/q42_rewrite_meta.json",
       "rewrite_mode": "mv_filter_projection_rollup",
-      "rewritten_sql": "SELECT date_dim_d_year AS d_year, item_i_category_id AS i_category_id, item_i_category AS i_category, SUM(sum_ext_sales_price) AS `sum(ss_ext_sales_price)` FROM mv_ss_dd_item_mgr1_y2000_m11_fg GROUP BY date_dim_d_year, item_i_category_id, item_i_category",
+      "rewritten_sql": "SELECT d_year, i_category_id, i_category, SUM(sum_ss_ext_sales_price) AS `sum(ss_ext_sales_price)` FROM mv_ss_dd_item_mgr1_y2000_m11_fg GROUP BY d_year, i_category_id, i_category ORDER BY `sum(ss_ext_sales_price)` DESC, d_year, i_category_id, i_category LIMIT 100",
       "residual_filters": [],
-      "rollup_exprs": ["GROUP BY date_dim_d_year, item_i_category_id, item_i_category"],
+      "rollup_exprs": ["GROUP BY d_year, i_category_id, i_category"],
       "semantic_check": {
         "status": "pass",
         "reason": "query can be derived from MV by projection and roll-up"
@@ -1116,12 +1144,14 @@ Agent-only 原型仍保留最低限度检查：
 23. `decision = materialize` 的 MV Candidate 必须包含非空 `column_mappings`。
 24. `output_columns` 不能包含 `.`；它只表示 MV 表真实物理列名。
 25. `column_mappings.source_table.source_column` 必须存在于 `tpcds_simple.json`。
-26. `build_sql` 必须显式包含 `AS mv_column`，不能依赖 Spark 自动列名。
+26. `build_sql` 中普通物理列默认不写 `AS`；聚合表达式必须显式包含 `AS measure_mv_column`。
 27. `build_sql` 必须使用 `CREATE TABLE ... AS SELECT ...`，不能使用 `CREATE OR REPLACE TABLE`。
 28. RewriteAgent 使用 MV 时不能引用源表限定列名；发现 `` `date_dim.d_year` `` 或 `date_dim.d_year` 这类引用时必须 fallback。
 29. RewriteAgent 必须保持 original SQL 中显式或隐式 alias，以及无 alias 表达式的 Spark 输出名；如果无法证明一致，必须 fallback。
 30. `ExecutorAgent.run_queries(...)` 必须从 rewrite meta 读取 `used_mv_ids` 并写入 execution order；如果 rewrite meta 缺少该字段，代码层直接失败。
 31. 代码层 SQL 操作必须通过 SQLGlot AST 完成；不得用正则表达式解析 SELECT 子句、判断列引用、规范化 CTAS 或改写 SQL。
+32. measure `mv_column` 必须符合 `{agg_func}_{source_column}`；例如 `sum_ss_ext_sales_price`，不能写成丢失源字段前缀的 `sum_ext_sales_price`。
+33. final rewrite 必须保留 original SQL 的 `ORDER BY` 和 `LIMIT`；代码层最多触发 2 次 LLM 修正，仍不满足则 fallback。
 
 ## 9. MVP 流程
 

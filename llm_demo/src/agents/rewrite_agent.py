@@ -10,14 +10,17 @@ from llm_demo.src.core.llm_client import LLMClient
 from llm_demo.src.core.schemas import RewriteOutput
 from llm_demo.src.core.sql_utils import (
     aliased_select_output_names,
+    order_limit_mismatch_reason,
     select_output_names,
     unaliased_select_output_names,
+    unknown_column_names,
     uses_source_qualified_columns,
 )
 
 
 class RewriteAgent(LLMRulesAgent):
     VALID_STAGES = {"historical", "final"}
+    FINAL_REWRITE_REPAIR_ATTEMPTS = 2
 
     def __init__(self, store: ArtifactStore, llm_client: LLMClient) -> None:
         super().__init__(store=store, llm_client=llm_client, agent_name="RewriteAgent")
@@ -62,13 +65,21 @@ class RewriteAgent(LLMRulesAgent):
         output = self._infer_structured(
             task=(
                 "evaluate candidate rewrite 输出：检查 query_id、rewrite_stage、used_mv_ids、fallback_reason "
-                "和语义等价说明；返回修正后的完整 RewriteOutput。"
+                "和语义等价说明；final rewrite 必须保留 original SQL 的 ORDER BY 和 LIMIT；返回修正后的完整 RewriteOutput。"
             ),
             context={"run_id": self.store.run_id, "batch_id": batch_id, "rewrite_stage": rewrite_stage},
             input_artifacts={**input_artifacts, "candidate_rewrite_output": candidate_output},
             output_model=RewriteOutput,
         )
-        output = self._apply_safety_fallbacks(output, materialized_mvs, queries)
+        if rewrite_stage == "final":
+            output = self._repair_final_order_limit(
+                output=output,
+                input_artifacts=input_artifacts,
+                materialized_mvs=materialized_mvs,
+                queries=queries,
+                batch_id=batch_id,
+            )
+        output = self._apply_safety_fallbacks(output, materialized_mvs, queries, rewrite_stage)
         self._validate_output(output, current_batch, materialized_mvs, batch_id, rewrite_stage)
 
         rewrite_dir_relative = f"05_rewritten_sql/batch_{batch_id}/{rewrite_stage}_rewrite"
@@ -173,6 +184,7 @@ class RewriteAgent(LLMRulesAgent):
         output: dict[str, Any],
         materialized_mvs: dict[str, Any],
         queries: list[dict[str, str]],
+        rewrite_stage: str,
     ) -> dict[str, Any]:
         queries_by_id = {query["query_id"]: query for query in queries}
         mv_by_id = {mv["mv_id"]: mv for mv in materialized_mvs.get("materialized_mvs", [])}
@@ -182,21 +194,92 @@ class RewriteAgent(LLMRulesAgent):
             query = queries_by_id.get(record["query_id"])
             if not query:
                 continue
-            reason = self._rewrite_fallback_reason(record, mv_by_id, query["original_sql"])
+            reason = self._rewrite_fallback_reason(record, mv_by_id, query["original_sql"], rewrite_stage)
             if reason:
                 self._convert_to_fallback(record, query, reason)
         return output
 
-    def _rewrite_fallback_reason(self, record: dict[str, Any], mv_by_id: dict[str, dict[str, Any]], original_sql: str) -> str | None:
+    def _repair_final_order_limit(
+        self,
+        *,
+        output: dict[str, Any],
+        input_artifacts: dict[str, Any],
+        materialized_mvs: dict[str, Any],
+        queries: list[dict[str, str]],
+        batch_id: int,
+    ) -> dict[str, Any]:
+        for attempt in range(1, self.FINAL_REWRITE_REPAIR_ATTEMPTS + 1):
+            issues = self._final_order_limit_issues(output, materialized_mvs, queries)
+            if not issues:
+                return output
+            output = self._infer_structured(
+                task=(
+                    "retry final rewrite：上一轮 rewritten SQL 没有保留 original SQL 的 ORDER BY 或 LIMIT。"
+                    "请只修正这些 query 的 rewritten SQL 和 meta；如果无法安全保留，返回 fallback。"
+                ),
+                context={
+                    "run_id": self.store.run_id,
+                    "batch_id": batch_id,
+                    "rewrite_stage": "final",
+                    "repair_attempt": attempt,
+                    "max_repair_attempts": self.FINAL_REWRITE_REPAIR_ATTEMPTS,
+                    "safety_issues": issues,
+                },
+                input_artifacts={**input_artifacts, "previous_rewrite_output": output, "safety_issues": issues},
+                output_model=RewriteOutput,
+            )
+        return output
+
+    def _final_order_limit_issues(
+        self,
+        output: dict[str, Any],
+        materialized_mvs: dict[str, Any],
+        queries: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        queries_by_id = {query["query_id"]: query for query in queries}
+        mv_by_id = {mv["mv_id"]: mv for mv in materialized_mvs.get("materialized_mvs", [])}
+        issues = []
+        for record in output.get("rewrites", []):
+            if record["status"] != "rewritten":
+                continue
+            query = queries_by_id.get(record["query_id"])
+            if not query:
+                continue
+            base_reason = self._rewrite_fallback_reason(
+                record,
+                mv_by_id,
+                query["original_sql"],
+                rewrite_stage="historical",
+            )
+            if base_reason:
+                continue
+            reason = order_limit_mismatch_reason(query["original_sql"], record["rewritten_sql"])
+            if reason:
+                issues.append({"query_id": record["query_id"], "reason": reason})
+        return issues
+
+    def _rewrite_fallback_reason(
+        self,
+        record: dict[str, Any],
+        mv_by_id: dict[str, dict[str, Any]],
+        original_sql: str,
+        rewrite_stage: str,
+    ) -> str | None:
+        allowed_mv_columns: set[str] = set()
         for mv_id in record.get("used_mv_ids", []):
             mv = mv_by_id.get(mv_id)
             if not mv:
                 continue
+            allowed_mv_columns.update(mv.get("output_columns", []))
             mappings = mv.get("column_mappings", [])
             if not mappings:
                 return "mv_column_mappings_missing"
             if uses_source_qualified_columns(record["rewritten_sql"], mappings):
                 return "mv_uses_source_qualified_columns"
+        if allowed_mv_columns:
+            unknown_columns = unknown_column_names(record["rewritten_sql"], allowed_mv_columns)
+            if unknown_columns:
+                return "mv_unknown_column"
 
         rewritten_output_names = select_output_names(record["rewritten_sql"])
         required_aliases = aliased_select_output_names(original_sql)
@@ -205,6 +288,10 @@ class RewriteAgent(LLMRulesAgent):
         required_output_names = unaliased_select_output_names(original_sql)
         if not required_output_names.issubset(rewritten_output_names):
             return "output_name_missing"
+        if rewrite_stage == "final":
+            order_limit_reason = order_limit_mismatch_reason(original_sql, record["rewritten_sql"])
+            if order_limit_reason:
+                return order_limit_reason
         return None
 
     def _convert_to_fallback(self, record: dict[str, Any], query: dict[str, str], reason: str) -> None:

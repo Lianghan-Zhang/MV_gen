@@ -18,7 +18,7 @@ class FamilyAgent(LLMRulesAgent):
         path = Path(query_blocks_path)
         query_blocks = self.store.read_json(path)
         output = self._infer_structured(
-            task="根据 QueryBlock 的 family_key / join skeleton 聚合 QueryFamily。",
+            task="根据 QueryBlock 的表集合相似度、ETL 宽表覆盖关系和安全门规则聚合 QueryFamily。",
             context={"run_id": self.store.run_id},
             input_artifacts=query_blocks,
             output_model=FamilyOutput,

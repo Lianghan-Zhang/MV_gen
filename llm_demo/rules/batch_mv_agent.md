@@ -37,9 +37,9 @@ BatchMVAgent 固定采用两次 LLM + rules 调用：
 22. `decision = "materialize"` 的 Candidate 必须包含 `mv_id`、`target_table_name` 和可执行 `build_sql`。
 23. `decision = "materialize"` 的 Candidate 必须包含非空 `column_mappings`，用于记录源字段到 MV 物理列的映射。
 24. `output_columns` 只能写 MV 的真实物理列名，不能写 `date_dim.d_year` 这类源表限定列名。
-25. 对直接来自物理表字段的 dimension / filter / projection 列，`mv_column` 使用 `{source_table}_{source_column}`，例如 `date_dim_d_year`、`item_i_brand_id`。
-26. measure 列必须使用稳定聚合别名，例如 `sum_ext_sales_price`。
-27. `build_sql` 中每个输出表达式都必须显式 `AS mv_column`，例如 `date_dim.d_year AS date_dim_d_year`。
+25. 对直接来自物理表字段的 dimension / filter / projection 列，默认不写 `AS`，`mv_column` 直接使用物理源字段名，例如 `date_dim.d_year -> d_year`、`item.i_brand_id -> i_brand_id`。
+26. measure 列必须使用稳定聚合别名，命名规则为 `{agg_func}_{source_column}`，例如 `SUM(store_sales.ss_ext_sales_price)` 对应 `sum_ss_ext_sales_price`；不要丢掉源字段自身的业务前缀。
+27. 只有聚合表达式和普通列同名冲突时才写 `AS mv_column`；无冲突普通列保持 `table.column` 形式，字段来源由 `column_mappings` 记录。
 28. `build_sql` 必须使用 `CREATE TABLE ... AS SELECT ...`，不要使用 `CREATE OR REPLACE TABLE`。
 29. `decision = "skip"` 可以不包含 `build_sql` 和 `mv_id`，但仍需保留 `candidate_id`、`source_batch_id`、`source_query_ids`、`family_id`、`target_queries`、`decision` 和 `reason`。
 30. evaluate 阶段必须检查 `source_batch_id` 是否等于当前 batch。
@@ -63,6 +63,31 @@ q52: date_dim.d_year, item.i_brand, item.i_brand_id
 ```
 
 因此可以生成更细粒度的聚合 superset MV，使 q42/q52 都能从 MV roll-up 得到。
+
+对应 `build_sql` 应保持普通物理列不加 alias，只给聚合表达式加稳定 alias：
+
+```sql
+CREATE TABLE mv_ss_dd_item_q42_q52_fg AS
+SELECT
+  date_dim.d_year,
+  item.i_category_id,
+  item.i_category,
+  item.i_brand,
+  item.i_brand_id,
+  SUM(store_sales.ss_ext_sales_price) AS sum_ss_ext_sales_price
+FROM date_dim
+JOIN store_sales ON date_dim.d_date_sk = store_sales.ss_sold_date_sk
+JOIN item ON store_sales.ss_item_sk = item.i_item_sk
+WHERE item.i_manager_id = 1
+  AND date_dim.d_moy = 11
+  AND date_dim.d_year IN (2000)
+GROUP BY
+  date_dim.d_year,
+  item.i_category_id,
+  item.i_category,
+  item.i_brand,
+  item.i_brand_id
+```
 
 输出示例：
 
@@ -103,86 +128,68 @@ q52: date_dim.d_year, item.i_brand, item.i_brand_id
         }
       ],
       "output_columns": [
-        "date_dim_d_year",
-        "date_dim_d_moy",
-        "item_i_manager_id",
-        "item_i_category_id",
-        "item_i_category",
-        "item_i_brand",
-        "item_i_brand_id",
-        "sum_ext_sales_price"
+        "d_year",
+        "i_category_id",
+        "i_category",
+        "i_brand",
+        "i_brand_id",
+        "sum_ss_ext_sales_price"
       ],
       "column_mappings": [
         {
           "source_expr": "date_dim.d_year",
           "source_table": "date_dim",
           "source_column": "d_year",
-          "mv_column": "date_dim_d_year",
+          "mv_column": "d_year",
           "role": "dimension"
-        },
-        {
-          "source_expr": "date_dim.d_moy",
-          "source_table": "date_dim",
-          "source_column": "d_moy",
-          "mv_column": "date_dim_d_moy",
-          "role": "filter"
-        },
-        {
-          "source_expr": "item.i_manager_id",
-          "source_table": "item",
-          "source_column": "i_manager_id",
-          "mv_column": "item_i_manager_id",
-          "role": "filter"
         },
         {
           "source_expr": "item.i_category_id",
           "source_table": "item",
           "source_column": "i_category_id",
-          "mv_column": "item_i_category_id",
+          "mv_column": "i_category_id",
           "role": "dimension"
         },
         {
           "source_expr": "item.i_category",
           "source_table": "item",
           "source_column": "i_category",
-          "mv_column": "item_i_category",
+          "mv_column": "i_category",
           "role": "dimension"
         },
         {
           "source_expr": "item.i_brand",
           "source_table": "item",
           "source_column": "i_brand",
-          "mv_column": "item_i_brand",
+          "mv_column": "i_brand",
           "role": "dimension"
         },
         {
           "source_expr": "item.i_brand_id",
           "source_table": "item",
           "source_column": "i_brand_id",
-          "mv_column": "item_i_brand_id",
+          "mv_column": "i_brand_id",
           "role": "dimension"
         },
         {
           "source_expr": "SUM(store_sales.ss_ext_sales_price)",
           "source_table": "store_sales",
           "source_column": "ss_ext_sales_price",
-          "mv_column": "sum_ext_sales_price",
+          "mv_column": "sum_ss_ext_sales_price",
           "role": "measure"
         }
       ],
       "group_by_exprs": [
         "date_dim.d_year",
-        "date_dim.d_moy",
-        "item.i_manager_id",
         "item.i_category_id",
         "item.i_category",
         "item.i_brand",
         "item.i_brand_id"
       ],
       "measure_exprs": [
-        "SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price"
+        "SUM(store_sales.ss_ext_sales_price) AS sum_ss_ext_sales_price"
       ],
-      "build_sql": "CREATE TABLE mv_ss_dd_item_q42_q52_fg AS SELECT date_dim.d_year AS date_dim_d_year, date_dim.d_moy AS date_dim_d_moy, item.i_manager_id AS item_i_manager_id, item.i_category_id AS item_i_category_id, item.i_category AS item_i_category, item.i_brand AS item_i_brand, item.i_brand_id AS item_i_brand_id, SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price FROM date_dim JOIN store_sales ON date_dim.d_date_sk = store_sales.ss_sold_date_sk JOIN item ON store_sales.ss_item_sk = item.i_item_sk WHERE item.i_manager_id = 1 AND date_dim.d_moy = 11 AND date_dim.d_year IN (2000) GROUP BY date_dim.d_year, date_dim.d_moy, item.i_manager_id, item.i_category_id, item.i_category, item.i_brand, item.i_brand_id",
+      "build_sql": "CREATE TABLE mv_ss_dd_item_q42_q52_fg AS SELECT date_dim.d_year, item.i_category_id, item.i_category, item.i_brand, item.i_brand_id, SUM(store_sales.ss_ext_sales_price) AS sum_ss_ext_sales_price FROM date_dim JOIN store_sales ON date_dim.d_date_sk = store_sales.ss_sold_date_sk JOIN item ON store_sales.ss_item_sk = item.i_item_sk WHERE item.i_manager_id = 1 AND date_dim.d_moy = 11 AND date_dim.d_year IN (2000) GROUP BY date_dim.d_year, item.i_category_id, item.i_category, item.i_brand, item.i_brand_id",
       "decision": "materialize",
       "reason": "q42 and q52 share join/filter and have roll-up-compatible SUM measures; fine-grain aggregate preserves both category and brand dimensions"
     }
@@ -243,38 +250,38 @@ date_dim.d_year IN (2000, 2001)
   "mv_type": "detail_superset",
   "mv_predicates": ["date_dim.d_year IN (2000, 2001)"],
   "output_columns": [
-    "date_dim_d_year",
-    "date_dim_d_moy",
-    "store_sales_ss_item_sk",
-    "store_sales_ss_ext_sales_price"
+    "d_year",
+    "d_moy",
+    "ss_item_sk",
+    "ss_ext_sales_price"
   ],
   "column_mappings": [
     {
       "source_expr": "date_dim.d_year",
       "source_table": "date_dim",
       "source_column": "d_year",
-      "mv_column": "date_dim_d_year",
+      "mv_column": "d_year",
       "role": "dimension"
     },
     {
       "source_expr": "date_dim.d_moy",
       "source_table": "date_dim",
       "source_column": "d_moy",
-      "mv_column": "date_dim_d_moy",
+      "mv_column": "d_moy",
       "role": "filter"
     },
     {
       "source_expr": "store_sales.ss_item_sk",
       "source_table": "store_sales",
       "source_column": "ss_item_sk",
-      "mv_column": "store_sales_ss_item_sk",
+      "mv_column": "ss_item_sk",
       "role": "detail"
     },
     {
       "source_expr": "store_sales.ss_ext_sales_price",
       "source_table": "store_sales",
       "source_column": "ss_ext_sales_price",
-      "mv_column": "store_sales_ss_ext_sales_price",
+      "mv_column": "ss_ext_sales_price",
       "role": "measure_source"
     }
   ],

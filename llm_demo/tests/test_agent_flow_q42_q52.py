@@ -29,8 +29,10 @@ SQL_PATHS = [
 class StaticLLM:
     def __init__(self, responses: list[dict]) -> None:
         self.responses = list(responses)
+        self.calls = 0
 
     def infer(self, prompt: str, load_json: bool = True) -> dict:
+        self.calls += 1
         if not self.responses:
             raise AssertionError("StaticLLM has no remaining responses")
         return json.loads(json.dumps(self.responses.pop(0)))
@@ -170,54 +172,54 @@ def mv_rewrite_state(store: ArtifactStore, mv_id: str = "mv_ok") -> Path:
                     "depends_on_mv_ids": [],
                     "mv_type": "fine_grain_aggregate",
                     "output_columns": [
-                        "date_dim_d_year",
-                        "item_i_category_id",
-                        "item_i_category",
-                        "item_i_brand_id",
-                        "item_i_brand",
-                        "sum_ext_sales_price",
+                        "d_year",
+                        "i_category_id",
+                        "i_category",
+                        "i_brand_id",
+                        "i_brand",
+                        "sum_ss_ext_sales_price",
                     ],
                     "column_mappings": [
                         {
                             "source_expr": "date_dim.d_year",
                             "source_table": "date_dim",
                             "source_column": "d_year",
-                            "mv_column": "date_dim_d_year",
+                            "mv_column": "d_year",
                             "role": "dimension",
                         },
                         {
                             "source_expr": "item.i_category_id",
                             "source_table": "item",
                             "source_column": "i_category_id",
-                            "mv_column": "item_i_category_id",
+                            "mv_column": "i_category_id",
                             "role": "dimension",
                         },
                         {
                             "source_expr": "item.i_category",
                             "source_table": "item",
                             "source_column": "i_category",
-                            "mv_column": "item_i_category",
+                            "mv_column": "i_category",
                             "role": "dimension",
                         },
                         {
                             "source_expr": "item.i_brand_id",
                             "source_table": "item",
                             "source_column": "i_brand_id",
-                            "mv_column": "item_i_brand_id",
+                            "mv_column": "i_brand_id",
                             "role": "dimension",
                         },
                         {
                             "source_expr": "item.i_brand",
                             "source_table": "item",
                             "source_column": "i_brand",
-                            "mv_column": "item_i_brand",
+                            "mv_column": "i_brand",
                             "role": "dimension",
                         },
                         {
                             "source_expr": "SUM(store_sales.ss_ext_sales_price)",
                             "source_table": "store_sales",
                             "source_column": "ss_ext_sales_price",
-                            "mv_column": "sum_ext_sales_price",
+                            "mv_column": "sum_ss_ext_sales_price",
                             "role": "measure",
                         },
                     ],
@@ -288,21 +290,21 @@ def test_executor_agent_dry_run_materializes_available_mvs_and_orders_queries() 
                     "target_queries": ["q42"],
                     "depends_on_mv_ids": [],
                     "group_by_exprs": ["date_dim.d_year"],
-                    "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price"],
-                    "output_columns": ["date_dim_d_year", "sum_ext_sales_price"],
+                    "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ss_ext_sales_price"],
+                    "output_columns": ["d_year", "sum_ss_ext_sales_price"],
                     "column_mappings": [
                         {
                             "source_expr": "date_dim.d_year",
                             "source_table": "date_dim",
                             "source_column": "d_year",
-                            "mv_column": "date_dim_d_year",
+                            "mv_column": "d_year",
                             "role": "dimension",
                         },
                         {
                             "source_expr": "SUM(store_sales.ss_ext_sales_price)",
                             "source_table": "store_sales",
                             "source_column": "ss_ext_sales_price",
-                            "mv_column": "sum_ext_sales_price",
+                            "mv_column": "sum_ss_ext_sales_price",
                             "role": "measure",
                         },
                     ],
@@ -400,10 +402,10 @@ def test_batch_mv_agent_rejects_materialize_candidate_without_column_mappings() 
                 "mv_type": "fine_grain_aggregate",
                 "target_table_name": "mv_missing_mappings",
                 "depends_on_mv_ids": [],
-                "output_columns": ["date_dim_d_year"],
+                "output_columns": ["d_year"],
                 "group_by_exprs": ["date_dim.d_year"],
                 "measure_exprs": [],
-                "build_sql": "CREATE TABLE mv_missing_mappings AS SELECT date_dim.d_year AS date_dim_d_year FROM date_dim",
+                "build_sql": "CREATE TABLE mv_missing_mappings AS SELECT date_dim.d_year FROM date_dim",
             }
         ],
     }
@@ -442,13 +444,13 @@ def test_batch_mv_agent_rejects_dotted_mv_output_columns() -> None:
                         "source_expr": "date_dim.d_year",
                         "source_table": "date_dim",
                         "source_column": "d_year",
-                        "mv_column": "date_dim_d_year",
+                        "mv_column": "d_year",
                         "role": "dimension",
                     }
                 ],
                 "group_by_exprs": ["date_dim.d_year"],
                 "measure_exprs": [],
-                "build_sql": "CREATE TABLE mv_dotted_columns AS SELECT date_dim.d_year AS date_dim_d_year FROM date_dim",
+                "build_sql": "CREATE TABLE mv_dotted_columns AS SELECT date_dim.d_year FROM date_dim",
             }
         ],
     }
@@ -481,19 +483,19 @@ def test_batch_mv_agent_normalizes_create_or_replace_to_create_table() -> None:
                 "mv_type": "fine_grain_aggregate",
                 "target_table_name": "mv_create_table",
                 "depends_on_mv_ids": [],
-                "output_columns": ["date_dim_d_year"],
+                "output_columns": ["d_year"],
                 "column_mappings": [
                     {
                         "source_expr": "date_dim.d_year",
                         "source_table": "date_dim",
                         "source_column": "d_year",
-                        "mv_column": "date_dim_d_year",
+                        "mv_column": "d_year",
                         "role": "dimension",
                     }
                 ],
                 "group_by_exprs": ["date_dim.d_year"],
                 "measure_exprs": [],
-                "build_sql": "CREATE OR REPLACE TABLE mv_create_table AS SELECT date_dim.d_year AS date_dim_d_year FROM date_dim",
+                "build_sql": "CREATE OR REPLACE TABLE mv_create_table AS SELECT date_dim.d_year FROM date_dim",
             }
         ],
     }
@@ -514,6 +516,62 @@ def test_batch_mv_agent_normalizes_create_or_replace_to_create_table() -> None:
     assert "CREATE OR REPLACE TABLE" not in mv_build_sql.upper()
 
 
+def test_batch_mv_agent_rejects_measure_alias_without_source_column_prefix() -> None:
+    store = make_store("test_batch_mv_measure_alias")
+    batches_path, query_blocks_path, families_path, historical_rewrite_dir = write_minimal_batch_mv_inputs(store, ["q42"])
+    output = {
+        "batch_id": 3,
+        "mv_candidates": [
+            {
+                "candidate_id": "cand_bad_measure_alias",
+                "source_batch_id": 3,
+                "source_query_ids": ["q42"],
+                "family_id": "family_ss_dd_item",
+                "target_queries": ["q42"],
+                "decision": "materialize",
+                "reason": "test",
+                "mv_id": "mv_bad_measure_alias",
+                "mv_type": "fine_grain_aggregate",
+                "target_table_name": "mv_bad_measure_alias",
+                "depends_on_mv_ids": [],
+                "output_columns": ["d_year", "sum_ext_sales_price"],
+                "column_mappings": [
+                    {
+                        "source_expr": "date_dim.d_year",
+                        "source_table": "date_dim",
+                        "source_column": "d_year",
+                        "mv_column": "d_year",
+                        "role": "dimension",
+                    },
+                    {
+                        "source_expr": "SUM(store_sales.ss_ext_sales_price)",
+                        "source_table": "store_sales",
+                        "source_column": "ss_ext_sales_price",
+                        "mv_column": "sum_ext_sales_price",
+                        "role": "measure",
+                    },
+                ],
+                "group_by_exprs": ["date_dim.d_year"],
+                "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price"],
+                "build_sql": (
+                    "CREATE TABLE mv_bad_measure_alias AS SELECT date_dim.d_year, "
+                    "SUM(store_sales.ss_ext_sales_price) AS sum_ext_sales_price FROM date_dim "
+                    "JOIN store_sales ON date_dim.d_date_sk = store_sales.ss_sold_date_sk GROUP BY date_dim.d_year"
+                ),
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="sum_ss_ext_sales_price"):
+        BatchMVAgent(store, StaticLLM([output, output])).run(
+            3,
+            batches_path,
+            query_blocks_path,
+            families_path,
+            historical_rewrite_dir,
+        )
+
+
 def test_rewrite_agent_falls_back_when_mv_rewrite_uses_source_qualified_columns() -> None:
     store = make_store("test_rewrite_source_qualified_columns")
     sql_manifest_path = SQLLoaderAgent(store).run([PROJECT_ROOT / "tpcds-spark" / "q42.sql"])
@@ -522,7 +580,7 @@ def test_rewrite_agent_falls_back_when_mv_rewrite_uses_source_qualified_columns(
     mv_state_path = mv_rewrite_state(store)
     bad_record = rewrite_record(
         "q42",
-        "SELECT `date_dim.d_year`, SUM(sum_ext_sales_price) FROM mv_ok GROUP BY `date_dim.d_year`",
+        "SELECT `date_dim.d_year`, SUM(sum_ss_ext_sales_price) FROM mv_ok GROUP BY `date_dim.d_year`",
     )
 
     rewrite_dir = RewriteAgent(store, StaticLLM([{"rewrites": [bad_record]}, {"rewrites": [bad_record]}])).run(
@@ -551,7 +609,7 @@ def test_rewrite_agent_falls_back_when_original_output_aliases_are_missing() -> 
     mv_state_path = mv_rewrite_state(store)
     bad_record = rewrite_record(
         "q52",
-        "SELECT date_dim_d_year, SUM(sum_ext_sales_price) AS ext_price FROM mv_ok GROUP BY date_dim_d_year",
+        "SELECT d_year, SUM(sum_ss_ext_sales_price) AS ext_price FROM mv_ok GROUP BY d_year",
     )
 
     rewrite_dir = RewriteAgent(store, StaticLLM([{"rewrites": [bad_record]}, {"rewrites": [bad_record]}])).run(
@@ -577,8 +635,8 @@ def test_rewrite_agent_falls_back_when_implicit_expression_output_name_is_missin
     mv_state_path = mv_rewrite_state(store)
     bad_record = rewrite_record(
         "q42",
-        "SELECT date_dim_d_year AS d_year, item_i_category_id AS i_category_id, item_i_category AS i_category, "
-        "SUM(sum_ext_sales_price) AS sum_ext_sales_price FROM mv_ok GROUP BY date_dim_d_year, item_i_category_id, item_i_category",
+        "SELECT d_year, i_category_id, i_category, "
+        "SUM(sum_ss_ext_sales_price) AS sum_ss_ext_sales_price FROM mv_ok GROUP BY d_year, i_category_id, i_category",
     )
 
     rewrite_dir = RewriteAgent(store, StaticLLM([{"rewrites": [bad_record]}, {"rewrites": [bad_record]}])).run(
@@ -596,6 +654,72 @@ def test_rewrite_agent_falls_back_when_implicit_expression_output_name_is_missin
     assert meta["fallback_reason"] == "output_name_missing"
 
 
+def test_rewrite_agent_falls_back_when_mv_rewrite_uses_unknown_mv_column() -> None:
+    store = make_store("test_rewrite_unknown_mv_column")
+    sql_manifest_path = SQLLoaderAgent(store).run([PROJECT_ROOT / "tpcds-spark" / "q42.sql"])
+    batches_path = write_minimal_complexity_batches(store, 3, "join_filter_groupby", ["q42"])
+    query_blocks_path = store.write_json("01_query_blocks/query_blocks.json", {"query_blocks": []})
+    mv_state_path = mv_rewrite_state(store)
+    bad_record = rewrite_record(
+        "q42",
+        "SELECT d_year, i_category_id, i_category, "
+        "SUM(sum_ext_sales_price) AS `sum(ss_ext_sales_price)` "
+        "FROM mv_ok GROUP BY d_year, i_category_id, i_category "
+        "ORDER BY `sum(ss_ext_sales_price)` DESC, d_year, i_category_id, i_category LIMIT 100",
+    )
+
+    rewrite_dir = RewriteAgent(store, StaticLLM([{"rewrites": [bad_record]}, {"rewrites": [bad_record]}])).run(
+        3,
+        "final",
+        batches_path,
+        sql_manifest_path,
+        query_blocks_path,
+        mv_state_path,
+    )
+
+    meta = store.read_json(rewrite_dir / "q42_rewrite_meta.json")
+    assert meta["status"] == "fallback"
+    assert meta["used_mv_ids"] == []
+    assert meta["fallback_reason"] == "mv_unknown_column"
+
+
+def test_rewrite_agent_retries_twice_then_falls_back_when_final_order_limit_is_missing() -> None:
+    store = make_store("test_rewrite_missing_order_limit")
+    sql_manifest_path = SQLLoaderAgent(store).run([PROJECT_ROOT / "tpcds-spark" / "q42.sql"])
+    batches_path = write_minimal_complexity_batches(store, 3, "join_filter_groupby", ["q42"])
+    query_blocks_path = store.write_json("01_query_blocks/query_blocks.json", {"query_blocks": []})
+    mv_state_path = mv_rewrite_state(store)
+    bad_record = rewrite_record(
+        "q42",
+        "SELECT d_year, i_category_id, i_category, "
+        "SUM(sum_ss_ext_sales_price) AS `sum(ss_ext_sales_price)` "
+        "FROM mv_ok GROUP BY d_year, i_category_id, i_category",
+    )
+    llm = StaticLLM(
+        [
+            {"rewrites": [bad_record]},
+            {"rewrites": [bad_record]},
+            {"rewrites": [bad_record]},
+            {"rewrites": [bad_record]},
+        ]
+    )
+
+    rewrite_dir = RewriteAgent(store, llm).run(
+        3,
+        "final",
+        batches_path,
+        sql_manifest_path,
+        query_blocks_path,
+        mv_state_path,
+    )
+
+    meta = store.read_json(rewrite_dir / "q42_rewrite_meta.json")
+    assert llm.calls == 4
+    assert meta["status"] == "fallback"
+    assert meta["used_mv_ids"] == []
+    assert meta["fallback_reason"] == "order_by_missing"
+
+
 def test_rewrite_agent_accepts_preserved_implicit_expression_output_name() -> None:
     store = make_store("test_rewrite_preserved_implicit_expression_name")
     sql_manifest_path = SQLLoaderAgent(store).run([PROJECT_ROOT / "tpcds-spark" / "q42.sql"])
@@ -604,9 +728,10 @@ def test_rewrite_agent_accepts_preserved_implicit_expression_output_name() -> No
     mv_state_path = mv_rewrite_state(store)
     good_record = rewrite_record(
         "q42",
-        "SELECT date_dim_d_year AS d_year, item_i_category_id AS i_category_id, item_i_category AS i_category, "
-        "SUM(sum_ext_sales_price) AS `sum(ss_ext_sales_price)` "
-        "FROM mv_ok GROUP BY date_dim_d_year, item_i_category_id, item_i_category",
+        "SELECT d_year, i_category_id, i_category, "
+        "SUM(sum_ss_ext_sales_price) AS `sum(ss_ext_sales_price)` "
+        "FROM mv_ok GROUP BY d_year, i_category_id, i_category "
+        "ORDER BY `sum(ss_ext_sales_price)` DESC, d_year, i_category_id, i_category LIMIT 100",
     )
 
     rewrite_dir = RewriteAgent(store, StaticLLM([{"rewrites": [good_record]}, {"rewrites": [good_record]}])).run(
@@ -712,6 +837,11 @@ def test_live_batch_cluster_batch_mv_and_self_iteration_agents_produce_artifacts
             assert all("." not in column for column in candidate["output_columns"])
             mapped_columns = {mapping["mv_column"] for mapping in candidate["column_mappings"]}
             assert set(candidate["output_columns"]).issubset(mapped_columns)
+            for mapping in candidate["column_mappings"]:
+                if mapping["role"] == "measure":
+                    assert mapping["mv_column"] == f"sum_{mapping['source_column']}"
+                else:
+                    assert mapping["mv_column"] == mapping["source_column"]
 
     records = [json.loads(line) for line in store.run_log_path.read_text(encoding="utf-8").splitlines()]
     batch_mv_records = [record for record in records if record["agent_name"] == "BatchMVAgent"]
@@ -794,6 +924,8 @@ def test_live_rewrite_executor_and_self_iteration_agents_complete_batch_flow() -
                 assert "ext_price" in rewritten_sql
             if query_id == "q42":
                 assert "`sum(ss_ext_sales_price)`" in rewritten_sql
+            assert "ORDER BY" in rewritten_sql.upper()
+            assert "LIMIT 100" in rewritten_sql.upper()
         else:
             assert meta["status"] == "fallback"
             assert meta["used_mv_ids"] == []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import time
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from llm_demo.src.core.llm_client import LLMClient
 from llm_demo.src.core.physical_schema import load_physical_schema, validate_physical_column
 from llm_demo.src.core.schemas import BatchMVOutput
 from llm_demo.src.core.sql_utils import (
+    aggregate_measure_column_name,
     create_table_select_output_names,
     normalize_create_table_as_select,
 )
@@ -209,15 +211,32 @@ class BatchMVAgent(LLMRulesAgent):
 
         build_sql = candidate.get("build_sql") or ""
         build_output_columns = create_table_select_output_names(build_sql)
+        non_measure_counts = Counter(
+            mapping["source_column"]
+            for mapping in mappings
+            if mapping["role"] != "measure"
+        )
         for mapping in mappings:
             validate_physical_column(physical_schema, mapping["source_table"], mapping["source_column"])
             mv_column = mapping["mv_column"]
             if mv_column.lower() not in build_output_columns:
-                raise ValueError(f"Candidate {candidate_id} build_sql must explicitly alias {mv_column}")
-            if mapping["role"] != "measure" and mapping["mv_column"] != f"{mapping['source_table']}_{mapping['source_column']}":
-                raise ValueError(
-                    f"Candidate {candidate_id} mv_column {mv_column} must use source_table_source_column naming"
-                )
+                raise ValueError(f"Candidate {candidate_id} build_sql must output MV column {mv_column}")
+            if mapping["role"] == "measure":
+                expected_mv_column = aggregate_measure_column_name(mapping["source_expr"], mapping["source_column"])
+                if mapping["mv_column"] != expected_mv_column:
+                    raise ValueError(
+                        f"Candidate {candidate_id} measure mv_column {mv_column} must be {expected_mv_column}"
+                    )
+            else:
+                expected_mv_column = self._expected_physical_column_name(mapping, non_measure_counts)
+                if mapping["mv_column"] != expected_mv_column:
+                    raise ValueError(f"Candidate {candidate_id} mv_column {mv_column} must be {expected_mv_column}")
+
+    def _expected_physical_column_name(self, mapping: dict[str, Any], column_counts: Counter[str]) -> str:
+        source_column = mapping["source_column"]
+        if column_counts[source_column] > 1:
+            return f"{mapping['source_table']}_{source_column}"
+        return source_column
 
     def _normalize_materialize_build_sql(self, output: dict[str, Any]) -> None:
         for candidate in output["mv_candidates"]:
