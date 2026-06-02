@@ -30,18 +30,40 @@
 
 ## 3. 开发顺序
 
+### Phase 0: 目录、配置与 rules
+
+- [ ] 确认 `llm_demo/` 下存在 `notebooks/`、`configs/`、`rules/`、`src/core/`、`src/agents/`、`tests/`。
+- [ ] 确认项目根目录存在 `.env`、`tpcds_simple.json`、`tpcds-spark/`。
+- [ ] 确认 `requirements.txt` 至少包含 `pytest`、`pydantic`、`openai`、`python-dotenv`、`PyYAML`、`nbformat`、`sqlglot`。
+- [ ] 更新 `configs/default.yaml` 与 `configs/paths.yaml`，让 notebook 可以指向项目根目录完整 `tpcds-spark/`。
+- [ ] 更新 `rules/_prompt_template.md`，保持中文模板、规则、输入 artifact、输出 schema、示例模块。
+- [ ] 更新全部 LLM Agent rules：
+  - `rules/feature_agent.md`
+  - `rules/family_agent.md`
+  - `rules/batch_cluster_agent.md`
+  - `rules/batch_mv_agent.md`
+  - `rules/rewrite_agent.md`
+  - `rules/self_iteration_agent.md`
+- [ ] `executor_agent.md` 只保留 dry-run 规则说明；`ExecutorAgent` 本身仍用代码实现。
+- [ ] 不新增独立 `rules/examples/` 目录；示例写入对应 rules Markdown。
+
 ### Phase 1: 基础设施
 
 - [ ] 更新 `ArtifactStore` 命名方法，覆盖全部全量 SQL artifact path。
+- [ ] 更新 `agent_base.py` / `LLMRulesAgent`，统一加载 `_prompt_template.md`、对应 Agent rules、输入 artifact、输出 schema，并执行 JSON schema 校验。
 - [ ] 更新 `schemas.py`，补齐 QueryBlock、Feature status、family candidates、coverage summary 等 schema。
+- [ ] 更新 `physical_schema.py`，读取根目录 `tpcds_simple.json`，只做物理表字段白名单校验，不自动修复 SQL。
+- [ ] 更新 `sql_utils.py`，集中封装 SQLGlot 解析、CTAS 检查、SELECT 输出列名提取、源表限定列检测、ORDER BY / LIMIT 校验。
 - [ ] 确认 `LLMClient` 仍只读取根目录 `.env`，不打印 key。
 - [ ] 确认 `run_log.jsonl` 每条事件都有同一 `run_id` 内唯一 `event_id`。
+- [ ] 涉及 MV Candidate 的 run log 必须带 `candidate_id`；普通 Agent 事件可为 `null`。
 
 ### Phase 2: SQLLoaderAgent
 
 - [ ] `SQLLoaderAgent` 读取完整 `tpcds-spark/`。
 - [ ] 输出 `00_raw_sql/sql_manifest.json`。
 - [ ] manifest 只记录 `query_id`、原始路径、相对路径、文件大小等元信息。
+- [ ] manifest 顺序稳定，后续 Feature 串行处理按该顺序执行。
 - [ ] 不复制 SQL 文件，不把 SQL Text 落入 manifest。
 
 ### Phase 3: QueryAnalysisRunner
@@ -54,6 +76,8 @@
   - `01_query_blocks/query_to_qbs.json`
   - `01_query_blocks/qb_to_query.json`
 - [ ] 输出 `01_query_blocks/feature_extract_status.json`。
+- [ ] status 至少包含 `success`、`partial_success`、`feature_failed`、`unsupported_sql_pattern`。
+- [ ] 失败记录包含 `query_id`、`attempt`、`stage`、`error_type`、`error_message` 和可选 `unsupported_reasons`。
 - [ ] 失败 Query 不中断 corpus，首轮结束后统一 retry 1 次。
 - [ ] retry 不携带上一轮错误上下文。
 - [ ] `resume_feature=True` 时只跳过当前 run 中 `success` / `partial_success` 的 Query。
@@ -76,6 +100,7 @@
   - `group_by_exprs`
   - `aggregate_exprs`
   - `complexity_type`
+  - `family_key`
   - `structural_flags`
   - `unsupported_reasons`
 - [ ] 保留 generate + evaluate 两次 LLM 调用。
@@ -90,9 +115,14 @@
 - [ ] 输出 `02_families/family_candidates.json`。
 - [ ] 先按 `core_fact_table_set` blocking。
 - [ ] 再按 table set signature 建 primary group。
+- [ ] 识别 TPC-DS fact table 白名单：`store_sales`、`catalog_sales`、`web_sales`、`store_returns`、`catalog_returns`、`web_returns`、`inventory`。
+- [ ] 支持 `dimension_only` family candidate，但不能和 fact-based group 混合。
 - [ ] 计算 Jaccard、Containment、predicate column set、measure set、group-by set。
 - [ ] 用 SQLGlot 计算或校验 join graph / predicate / aggregate 相关结构。
 - [ ] 生成 `join_signature` 和 `normalized_join_edges`。
+- [ ] primary group 内先按 `join_signature` 拆分 sub-group。
+- [ ] 只在满足基础门槛时记录 `related_groups`，供 FamilyAgent evaluate。
+- [ ] `family_candidates.json` 采用 group-level 为主、必要 `pair_evidence` 为辅，不保存完整 O(n^2) pair 矩阵。
 - [ ] `unsupported_reasons` 非空的 QueryBlock 只作为诊断证据，不进入可合并成员。
 
 ### Phase 6: FamilyAgent
@@ -106,6 +136,9 @@
   - predicate column set 完全不同默认不合并。
   - 多 fact table 只和相同 `core_fact_table_set` 比较。
   - dimension-only family 不和 fact-based family 混合。
+- [ ] FamilyAgent 采用 generate + evaluate 两次 LLM 调用。
+- [ ] evaluate 检查重复 family、可合并 family、错误拆分、错误合并、成员 QueryBlock 归属错误。
+- [ ] 输出 `common_predicates`、`predicate_shapes`、`union_group_by_exprs`、`union_measure_exprs` 等供 BatchMVAgent 使用的字段。
 
 ### Phase 7: BatchClusterAgent
 
@@ -120,6 +153,9 @@
 - [ ] batch 执行单位是完整 SQL / `query_id`。
 - [ ] 一个 SQL 的 batch 由可用 QueryBlock 的最高复杂度决定。
 - [ ] `family_groups` 只作为 batch 内组织信息。
+- [ ] 顶层 `query_ids` 必须去重；同一 SQL 可出现在多个 `family_groups`，但最终 rewrite / execution 只能发生一次。
+- [ ] `family_groups[].qb_ids` 只包含可用 QueryBlock，不包含带 `unsupported_reasons` 的 QueryBlock。
+- [ ] BatchClusterAgent 采用 generate + evaluate 两次 LLM 调用。
 - [ ] 不做并发上限和子 batch 拆分。
 
 ### Phase 8: BatchWorkflowRunner
@@ -134,6 +170,8 @@
   5. dry-run query order
 - [ ] 如果 batch 为空，跳过。
 - [ ] Runner 只编排路径和调用顺序，不判断 MV 是否应生成，也不判断 SQL 是否可 rewrite。
+- [ ] historical rewrite 和 final rewrite 都以当前 batch 的 original SQL 为语义锚点。
+- [ ] 每个 batch 只执行一次固定闭环，不做 batch 内无限迭代。
 
 ### Phase 9: BatchMVAgent
 
@@ -149,6 +187,13 @@
 - [ ] 普通物理列默认不 `AS`；聚合表达式必须显式 `AS {agg_func}_{source_column}`。
 - [ ] `output_columns` 是 MV 真实物理列名，不能包含 `.`。
 - [ ] `column_mappings.source_table.source_column` 必须存在于 `tpcds_simple.json`。
+- [ ] `decision = materialize` 必须包含 `candidate_id`、`mv_id`、`target_table_name`、`build_sql`、`column_mappings`、`source_query_ids`、`target_queries`。
+- [ ] `source_query_ids` / `target_queries` 都必须属于当前 batch。
+- [ ] `source_qb_ids` / `target_qb_ids` 必须属于对应 Query、同一 family，且不能包含带 `unsupported_reasons` 的 QueryBlock。
+- [ ] 支持 `mv_type = fine_grain_aggregate | detail_superset | dimension_only`。
+- [ ] shared upstream superset MV 要记录 `residual_filters`；有限泛化谓词要记录 `generalized_predicates`。
+- [ ] `depends_on_mv_ids` 只能引用可见历史 MV，且依赖关系不能成环。
+- [ ] 如果发现跨 family 复用机会，只能写入 `reason` 或 run log，不能跨 family 生成 Candidate。
 - [ ] `decision = skip` 保留在 candidate artifact 和 run log，不写入 `materialized_mvs.json`。
 
 ### Phase 10: RewriteAgent
@@ -159,19 +204,25 @@
   - `{query_id}_rewritten.sql`
   - `{query_id}_rewrite_meta.json`
 - [ ] 即使无可用 MV，也必须输出 original-equivalent rewritten SQL。
+- [ ] fallback 时 `status = "fallback"`、`used_mv_ids = []`、`fallback_reason` 非空。
+- [ ] rewritten 时 `status = "rewritten"`、`used_mv_ids` 非空且均存在于 `materialized_mvs.json`。
+- [ ] 只能使用 `available_from_batch <= current_batch_id` 的 MV。
 - [ ] 使用 MV 时只能引用 MV 物理列名，不能引用源表限定列名。
 - [ ] final rewrite 必须保持 original SQL 的输出列名、`ORDER BY`、`LIMIT`。
+- [ ] final rewrite 若丢失 `ORDER BY` / `LIMIT`，最多触发 2 次 LLM 修正，仍失败则 fallback。
 - [ ] 无法证明等价时 fallback。
-- [ ] QueryBlock-local rewrite 只允许改写可证明安全的 CTE / subquery body。
+- [ ] QueryBlock-local rewrite 只允许改写可证明安全的 CTE / subquery body，并且 meta 必须包含非空 `target_qb_ids`。
+- [ ] QueryBlock-local rewrite 不能改变外层 Query 的 SELECT / JOIN / WHERE / GROUP BY / ORDER BY / LIMIT 结构。
 
 ### Phase 11: ExecutorAgent
 
 - [ ] 固定 dry-run，不连接 Spark。
 - [ ] `materialize_mvs(...)` 将 `decision = materialize` 且依赖满足的 Candidate 写入 `materialized_mvs.json`。
+- [ ] 写入 `materialized_mvs.json` 时补齐 `source_candidate_id`、`source_batch_id`、`available_from_batch`、`family_id`、`source_qb_ids`、`target_qb_ids`、`depends_on_mv_ids`、`output_columns`、`column_mappings`、`build_sql_path`。
 - [ ] 失败或 skip Candidate 只写 run log。
 - [ ] `run_queries(...)` 读取 final rewrite SQL 和 meta。
 - [ ] 输出 `06_execution_logs/batch_{batch_id}_execution_order.json`。
-- [ ] `run_query.depends_on_mv_ids` 必须来自 rewrite meta 的 `used_mv_ids`。
+- [ ] `run_query.depends_on_mv_ids` 必须来自 rewrite meta 的 `used_mv_ids`；rewrite meta 缺少该字段时直接失败。
 
 ### Phase 12: CoverageSummaryBuilder
 
@@ -186,6 +237,7 @@
   - MV Candidate materialize / skip / failed
   - historical / final rewrite fallback
   - execution order 覆盖
+- [ ] 汇总 top unsupported reasons、top fallback reasons、unassigned query ids、queries using MV 等关键诊断字段。
 - [ ] 只做诊断，不参与业务决策。
 
 ### Phase 13: SelfIterationAgent
@@ -194,8 +246,11 @@
 - [ ] 输入 run log、coverage summary、family candidates、MV candidates、rewrite meta、execution order。
 - [ ] 输出 `07_feedback/feedback_rules_{run_id}.json`。
 - [ ] 不自动修改 `rules/*.md`、代码或配置。
+- [ ] 输出按 `target_agent` 分组。
+- [ ] `suggested_rule_text` 使用中文；SQL、字段名、JSON key、Agent 名称保持英文。
 - [ ] 每条 suggestion 必须包含 `evidence_refs`。
 - [ ] 如果 evidence 引用 run log，必须包含 `event_id`。
+- [ ] 如果 evidence 引用 MV Candidate，必须包含 `candidate_id`。
 
 ### Phase 14: Notebook 与后续 main.py
 
@@ -245,12 +300,20 @@
 - [ ] `QueryAnalysisRunner` 首轮失败后统一 retry 1 次。
 - [ ] `QueryAnalysisRunner(resume_feature=True)` 跳过当前 run 已成功 Query。
 - [ ] Feature artifact merge 保持 `query_to_qbs` / `qb_to_query` 双向一致。
+- [ ] `physical_schema.py` 能用 `tpcds_simple.json` 校验存在 / 不存在的 `table.column`。
+- [ ] `sql_utils.py` 能用 SQLGlot 检查 CTAS、SELECT 输出列、源表限定列、ORDER BY / LIMIT。
 - [ ] `FamilyCandidateBuilder` 输出 group-level candidates，不保存完整 O(n^2) pair 矩阵。
 - [ ] BatchCluster 输出四个 global batch。
 - [ ] BatchWorkflowRunner 按固定五步调用各 Agent。
+- [ ] BatchMVAgent 校验 `output_columns` 不能包含 `.`。
+- [ ] BatchMVAgent 校验 `CREATE OR REPLACE TABLE` 不允许。
+- [ ] BatchMVAgent 校验 `column_mappings.source_table.source_column` 必须存在于 `tpcds_simple.json`。
+- [ ] BatchMVAgent 校验 `depends_on_mv_ids` 只能引用可见历史 MV，且不能成环。
+- [ ] RewriteAgent 遇到源表限定列名、输出列名丢失、ORDER BY / LIMIT 丢失时 fallback。
 - [ ] Executor dry-run 正确维护 `materialized_mvs.json`。
 - [ ] execution order 的 `depends_on_mv_ids` 来自 rewrite meta。
 - [ ] CoverageSummaryBuilder 能在部分失败 artifact 下生成 summary。
+- [ ] SelfIterationAgent 输出按 target agent 分组，且每条 suggestion 有 `evidence_refs`。
 
 ### Live / Integration Tests
 
