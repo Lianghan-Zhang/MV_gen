@@ -50,6 +50,41 @@ class FeatureAgent(LLMRulesAgent):
         )
         return query_blocks_path
 
+    def extract_one(self, query: dict[str, str], attempt: int = 1) -> dict:
+        started_at = time.monotonic()
+        query_with_sql = self._query_with_sql_text(query)
+        query_id = query_with_sql["query_id"]
+        extracted_output = self._infer_structured(
+            task="从单条输入 SQL Text 中提取 QueryBlock，并输出 query_to_qbs 与 qb_to_query 索引。",
+            context={"run_id": self.store.run_id, "expected_query_ids": [query_id], "attempt": attempt},
+            input_artifacts={"query": query_with_sql},
+            output_model=FeatureOutput,
+        )
+        output = self._infer_structured(
+            task=(
+                "对 candidate_feature_output 进行 evaluate：检查 outer、CTE、subquery、set branch QueryBlock 是否完整，"
+                "检查是否使用物理表名而非 SQL alias，检查 query_id/qb_id 索引是否一致；"
+                "如发现 alias 或不合规字段，直接返回修正后的 FeatureOutput。"
+            ),
+            context={"run_id": self.store.run_id, "expected_query_ids": [query_id], "attempt": attempt},
+            input_artifacts={"query": query_with_sql, "candidate_feature_output": extracted_output},
+            output_model=FeatureOutput,
+        )
+        self._validate_expected_queries(output, [query_id])
+        self.store.append_run_log(
+            agent_name=self.agent_name,
+            event="extract_one_success",
+            input_artifact_paths=[query.get("sql_path", query.get("sql_path_relative", query_id))],
+            output_artifact_paths=[],
+            elapsed_ms=self._elapsed_ms(started_at),
+            details={
+                "query_id": query_id,
+                "attempt": attempt,
+                "qb_ids": output["query_to_qbs"].get(query_id, []),
+            },
+        )
+        return output
+
     def _load_queries(self, raw_artifact: Path) -> list[dict[str, str]]:
         if raw_artifact.is_dir():
             return [
@@ -64,6 +99,16 @@ class FeatureAgent(LLMRulesAgent):
             sql_path = self._resolve_sql_path(item)
             queries.append({"query_id": query_id, "sql_text": sql_path.read_text(encoding="utf-8")})
         return queries
+
+    def _query_with_sql_text(self, query: dict[str, str]) -> dict[str, str]:
+        if query.get("sql_text"):
+            return {"query_id": query["query_id"], "sql_text": query["sql_text"]}
+        sql_path = self._resolve_sql_path(query)
+        return {
+            "query_id": query["query_id"],
+            "sql_text": sql_path.read_text(encoding="utf-8"),
+            "sql_path": str(sql_path),
+        }
 
     def _resolve_sql_path(self, manifest_item: dict) -> Path:
         sql_path = Path(manifest_item["sql_path"])

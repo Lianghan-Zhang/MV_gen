@@ -1,6 +1,6 @@
 # 职责
 
-读取 run log，输出下一轮 Rules 或配置修改建议。
+读取 run log、coverage summary、family candidates、MV candidates、rewrite meta 和 execution order，输出下一轮 Rules 或配置修改建议。
 
 # 规则
 
@@ -25,6 +25,10 @@
 19. 可以基于 BatchMVAgent 或 ExecutorAgent 日志提出 MV 列映射建议，例如 materialize candidate 缺少 `column_mappings`、`output_columns` 仍使用源表限定列名、普通物理列不必要地使用 table 前缀 alias、measure `mv_column` 未按 `{agg_func}_{source_column}` 命名、聚合表达式缺少显式 `AS measure_mv_column`。
 20. 可以基于 RewriteAgent fallback 日志提出 rewrite 规则建议，例如 `mv_uses_source_qualified_columns` 表示 rewritten SQL 错误引用了源表限定列名，`mv_unknown_column` 表示 rewritten SQL 引用了未出现在 MV `output_columns` 中的物理列，`output_alias_missing` 表示显式或隐式 alias 未保持，`output_name_missing` 表示无 alias 表达式的原始输出列名未保持，`order_by_missing` / `limit_missing` 表示 final rewrite 未保留 original SQL 的排序或 limit。
 21. 如果 execution order 中的 `run_query.depends_on_mv_ids` 与对应 rewrite meta 的 `used_mv_ids` 不一致，应建议修正 ExecutorAgent 规则或实现。
+22. 可以基于 `coverage_summary.json` 提出 intake 覆盖率建议，例如 `feature_failed` 过多、unsupported QueryBlock 比例过高、某个 batch 缺少 query。
+23. 可以基于 `family_candidates.json` 提出 FamilyAgent 规则建议，例如候选过粗、候选过细、同一 core fact table 下 Jaccard/Containment 证据未被正确使用。
+24. 可以基于 QueryBlock-local rewrite meta 提出 RewriteAgent 规则建议，例如 `target_qb_ids` 缺失、指向 unsupported QueryBlock、或 rewrite meta 未说明 CTE / subquery 局部改写范围。
+25. SelfIterationAgent 不允许自动修改 rules 文件，只输出 `feedback_rules_{run_id}.json`。
 
 # 示例
 

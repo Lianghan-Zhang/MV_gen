@@ -6,18 +6,23 @@ from pydantic import BaseModel, Field
 
 
 ComplexityType = Literal["join", "join_filter", "join_filter_groupby", "other"]
-MVType = Literal["fine_grain_aggregate", "detail_superset"]
+MVType = Literal["fine_grain_aggregate", "detail_superset", "dimension_only"]
 MVDecision = Literal["materialize", "skip"]
 RewriteStage = Literal["historical", "final"]
 RewriteStatus = Literal["rewritten", "fallback"]
 ExecutionStepType = Literal["materialize_mv", "run_query"]
 ExecutionStatus = Literal["success", "failed", "skipped", "planned"]
+FeatureStatus = Literal["success", "partial_success", "feature_failed", "unsupported_sql_pattern"]
 
 
 class QueryBlock(BaseModel):
     qb_id: str
     query_id: str
+    block_name: str | None = None
     scope_type: str = "outer"
+    parent_qb_id: str | None = None
+    depends_on_qb_ids: list[str] = Field(default_factory=list)
+    structural_flags: list[str] = Field(default_factory=list)
     tables: list[str] = Field(default_factory=list)
     join_edges: list[Any] = Field(default_factory=list)
     predicates: list[str] = Field(default_factory=list)
@@ -34,9 +39,65 @@ class FeatureOutput(BaseModel):
     qb_to_query: dict[str, str]
 
 
+class FeatureQueryStatus(BaseModel):
+    query_id: str
+    status: FeatureStatus
+    attempts: int = 1
+    qb_ids: list[str] = Field(default_factory=list)
+    unsupported_reasons: list[str] = Field(default_factory=list)
+    error_type: str | None = None
+    error_message: str | None = None
+
+
+class FeatureExtractStatus(BaseModel):
+    run_id: str
+    queries: list[FeatureQueryStatus] = Field(default_factory=list)
+
+
+class FamilyCandidateMember(BaseModel):
+    qb_id: str
+    query_id: str
+    tables: list[str] = Field(default_factory=list)
+    predicates: list[str] = Field(default_factory=list)
+    group_by_exprs: list[str] = Field(default_factory=list)
+    aggregate_exprs: list[str] = Field(default_factory=list)
+
+
+class FamilyPairEvidence(BaseModel):
+    left_qb_id: str
+    right_qb_id: str
+    table_jaccard: float
+    table_containment: float
+    shared_tables: list[str] = Field(default_factory=list)
+    shared_predicates: list[str] = Field(default_factory=list)
+    shared_measures: list[str] = Field(default_factory=list)
+    reason: str
+
+
+class FamilyCandidate(BaseModel):
+    candidate_family_id: str
+    family_type: str
+    candidate_key: str
+    core_fact_table_set: list[str] = Field(default_factory=list)
+    table_set: list[str] = Field(default_factory=list)
+    join_signature: list[str] = Field(default_factory=list)
+    predicate_set: list[str] = Field(default_factory=list)
+    group_by_set: list[str] = Field(default_factory=list)
+    measure_set: list[str] = Field(default_factory=list)
+    members: list[FamilyCandidateMember] = Field(default_factory=list)
+    pair_evidence: list[FamilyPairEvidence] = Field(default_factory=list)
+    unsupported_qb_ids: list[str] = Field(default_factory=list)
+
+
+class FamilyCandidateOutput(BaseModel):
+    family_candidates: list[FamilyCandidate] = Field(default_factory=list)
+
+
 class QueryFamily(BaseModel):
     family_id: str
     family_key: str
+    family_type: str | None = None
+    core_fact_table_set: list[str] = Field(default_factory=list)
     members: list[str]
     common_tables: list[str] = Field(default_factory=list)
     common_join_skeleton: list[Any] = Field(default_factory=list)
@@ -90,8 +151,10 @@ class MVCandidate(BaseModel):
     candidate_id: str
     source_batch_id: int
     source_query_ids: list[str]
+    source_qb_ids: list[str] = Field(default_factory=list)
     family_id: str
     target_queries: list[str]
+    target_qb_ids: list[str] = Field(default_factory=list)
     decision: MVDecision
     reason: str
     mv_id: str | None = None
@@ -127,6 +190,7 @@ class RewriteRecord(BaseModel):
     rewritten_sql_path: str
     rewrite_meta_path: str
     rewrite_mode: str
+    target_qb_ids: list[str] = Field(default_factory=list)
     rewritten_sql: str
     residual_filters: list[Any] = Field(default_factory=list)
     rollup_exprs: list[Any] = Field(default_factory=list)
@@ -183,6 +247,19 @@ class AgentRuleSuggestions(BaseModel):
 class SelfIterationFeedback(BaseModel):
     run_id: str
     agent_rule_suggestions: dict[str, AgentRuleSuggestions] = Field(default_factory=dict)
+
+
+class CoverageSummary(BaseModel):
+    run_id: str
+    total_queries: int = 0
+    feature_status_counts: dict[str, int] = Field(default_factory=dict)
+    family_candidate_count: int = 0
+    family_count: int = 0
+    batch_query_counts: dict[str, int] = Field(default_factory=dict)
+    mv_candidate_counts: dict[str, int] = Field(default_factory=dict)
+    rewrite_status_counts: dict[str, int] = Field(default_factory=dict)
+    execution_step_counts: dict[str, int] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
 
 
 def validate_model(model_cls: type[BaseModel], data: dict[str, Any]) -> BaseModel:

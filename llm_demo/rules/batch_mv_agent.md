@@ -25,33 +25,35 @@ BatchMVAgent 固定采用两次 LLM + rules 调用：
 10. 如果所有 target Query 都是聚合查询，measure 可 roll-up，且 group-by 粒度足以支持所有 target Query，优先生成 `mv_type = "fine_grain_aggregate"`。
 11. fine-grain aggregate MV 的 `group_by_exprs` 必须包含所有 target Query 的 roll-up 维度，以及 residual filter 所需的过滤列。
 12. 如果无法安全聚合，或者下游需要明细字段、非可加聚合、复杂表达式，则 fallback 生成 `mv_type = "detail_superset"`。
-13. 如果 detail superset MV 也无法证明能安全支持 target Query rewrite，则 `decision = "skip"`。
-14. 只有所有 `target_queries` 共同拥有的 predicate shape 才能进入共享 MV predicate。
-15. 共同 predicate shape 可以做当前 batch 内有限泛化，例如 `date_dim.d_year IN (2000, 2001)`。
-16. 泛化常量集合只能来自当前 batch、当前 family group 中已出现的 QueryBlock。
-17. 非共同 predicate shape 不进入共享 MV predicate，必须按 query 记录到 `residual_filters`。
-18. MV 必须保留执行 `residual_filters`、projection 和 roll-up 所需的列或 group-by 粒度。
-19. 不允许为了覆盖未来 batch 直接去掉共同 predicate，或生成覆盖整列范围的宽 MV。
-20. 如果 build SQL 依赖历史 MV，必须在 `depends_on_mv_ids` 中记录直接依赖；不依赖历史 MV 时使用空数组。
-21. `depends_on_mv_ids` 只能引用已成功物化且当前 batch 可见的 MV。
-22. `decision = "materialize"` 的 Candidate 必须包含 `mv_id`、`target_table_name` 和可执行 `build_sql`。
-23. `decision = "materialize"` 的 Candidate 必须包含非空 `column_mappings`，用于记录源字段到 MV 物理列的映射。
-24. `output_columns` 只能写 MV 的真实物理列名，不能写 `date_dim.d_year` 这类源表限定列名。
-25. 对直接来自物理表字段的 dimension / filter / projection 列，默认不写 `AS`，`mv_column` 直接使用物理源字段名，例如 `date_dim.d_year -> d_year`、`item.i_brand_id -> i_brand_id`。
-26. measure 列必须使用稳定聚合别名，命名规则为 `{agg_func}_{source_column}`，例如 `SUM(store_sales.ss_ext_sales_price)` 对应 `sum_ss_ext_sales_price`；不要丢掉源字段自身的业务前缀。
-27. 只有聚合表达式和普通列同名冲突时才写 `AS mv_column`；无冲突普通列保持 `table.column` 形式，字段来源由 `column_mappings` 记录。
-28. `build_sql` 必须使用 `CREATE TABLE ... AS SELECT ...`，不要使用 `CREATE OR REPLACE TABLE`。
-29. `decision = "skip"` 可以不包含 `build_sql` 和 `mv_id`，但仍需保留 `candidate_id`、`source_batch_id`、`source_query_ids`、`family_id`、`target_queries`、`decision` 和 `reason`。
-30. evaluate 阶段必须检查 `source_batch_id` 是否等于当前 batch。
-31. evaluate 阶段必须检查 `source_query_ids` 和 `target_queries` 是否都属于当前 batch，且不能使用未来 batch Query 作为结构化 target。
-32. evaluate 阶段必须检查每个 Candidate 是否只绑定一个 `family_id`；跨 family Candidate 必须拆回单 family，或记录 family 质量问题并 skip。
-33. evaluate 阶段必须检查 `mv_type` 是否与可证明 rewrite 关系一致：能安全 roll-up 才能使用 `fine_grain_aggregate`，否则 fallback 到 `detail_superset`，仍不安全则 skip。
-34. evaluate 阶段必须检查 `mv_predicates`、`generalized_predicates` 和 `residual_filters`：共同 predicate shape 才能进入 MV predicate，非共同 predicate 必须进入对应 query 的 residual filter。
-35. evaluate 阶段必须检查 `output_columns`、`group_by_exprs` 和 `measure_exprs` 是否保留 residual filter、projection 和 roll-up 所需信息。
-36. evaluate 阶段必须检查 `depends_on_mv_ids` 是否只引用当前 batch 可见的已物化 MV，且不会形成依赖循环。
-37. evaluate 阶段必须检查 `build_sql` 是否与 Candidate spec 对齐，包括 predicate、输出列、group by、measure 和历史 MV 依赖。
-38. 如果 Candidate 只由未来复用价值触发，而没有当前 batch 的 Query 或 QueryFamily 依据，evaluate 必须删除该 Candidate 或改为 `decision = "skip"`。
-39. evaluate 阶段必须检查 `column_mappings` 是否覆盖所有 `output_columns`，且 `source_table.source_column` 来自物理表字段。
+13. 如果 MV 只覆盖维表过滤、维表投影或 CTE 维度子结构，且不包含事实表 measure，可使用 `mv_type = "dimension_only"`。
+14. 如果 detail superset MV 也无法证明能安全支持 target Query rewrite，则 `decision = "skip"`。
+15. 只有所有 `target_queries` 共同拥有的 predicate shape 才能进入共享 MV predicate。
+16. 共同 predicate shape 可以做当前 batch 内有限泛化，例如 `date_dim.d_year IN (2000, 2001)`。
+17. 泛化常量集合只能来自当前 batch、当前 family group 中已出现的 QueryBlock。
+18. 非共同 predicate shape 不进入共享 MV predicate，必须按 query 记录到 `residual_filters`。
+19. MV 必须保留执行 `residual_filters`、projection 和 roll-up 所需的列或 group-by 粒度。
+20. 不允许为了覆盖未来 batch 直接去掉共同 predicate，或生成覆盖整列范围的宽 MV。
+21. 如果 build SQL 依赖历史 MV，必须在 `depends_on_mv_ids` 中记录直接依赖；不依赖历史 MV 时使用空数组。
+22. `depends_on_mv_ids` 只能引用已成功物化且当前 batch 可见的 MV。
+23. `decision = "materialize"` 的 Candidate 必须包含 `mv_id`、`target_table_name` 和可执行 `build_sql`。
+24. `decision = "materialize"` 的 Candidate 必须包含非空 `source_qb_ids` 和 `target_qb_ids`；这些 QueryBlock 必须属于当前 batch、当前 family，且不能包含 `unsupported_reasons`。
+25. `decision = "materialize"` 的 Candidate 必须包含非空 `column_mappings`，用于记录源字段到 MV 物理列的映射。
+26. `output_columns` 只能写 MV 的真实物理列名，不能写 `date_dim.d_year` 这类源表限定列名。
+27. 对直接来自物理表字段的 dimension / filter / projection 列，默认不写 `AS`，`mv_column` 直接使用物理源字段名，例如 `date_dim.d_year -> d_year`、`item.i_brand_id -> i_brand_id`。
+28. measure 列必须使用稳定聚合别名，命名规则为 `{agg_func}_{source_column}`，例如 `SUM(store_sales.ss_ext_sales_price)` 对应 `sum_ss_ext_sales_price`；不要丢掉源字段自身的业务前缀。
+29. 只有聚合表达式和普通列同名冲突时才写 `AS mv_column`；无冲突普通列保持 `table.column` 形式，字段来源由 `column_mappings` 记录。
+30. `build_sql` 必须使用 `CREATE TABLE ... AS SELECT ...`，不要使用 `CREATE OR REPLACE TABLE`。
+31. `decision = "skip"` 可以不包含 `build_sql` 和 `mv_id`，但仍需保留 `candidate_id`、`source_batch_id`、`source_query_ids`、`family_id`、`target_queries`、`decision` 和 `reason`。
+32. evaluate 阶段必须检查 `source_batch_id` 是否等于当前 batch。
+33. evaluate 阶段必须检查 `source_query_ids` 和 `target_queries` 是否都属于当前 batch，且不能使用未来 batch Query 作为结构化 target。
+34. evaluate 阶段必须检查每个 Candidate 是否只绑定一个 `family_id`；跨 family Candidate 必须拆回单 family，或记录 family 质量问题并 skip。
+35. evaluate 阶段必须检查 `mv_type` 是否与可证明 rewrite 关系一致：能安全 roll-up 才能使用 `fine_grain_aggregate`，否则 fallback 到 `detail_superset`，仍不安全则 skip。
+36. evaluate 阶段必须检查 `mv_predicates`、`generalized_predicates` 和 `residual_filters`：共同 predicate shape 才能进入 MV predicate，非共同 predicate 必须进入对应 query 的 residual filter。
+37. evaluate 阶段必须检查 `output_columns`、`group_by_exprs` 和 `measure_exprs` 是否保留 residual filter、projection 和 roll-up 所需信息。
+38. evaluate 阶段必须检查 `depends_on_mv_ids` 是否只引用当前 batch 可见的已物化 MV，且不会形成依赖循环。
+39. evaluate 阶段必须检查 `build_sql` 是否与 Candidate spec 对齐，包括 predicate、输出列、group by、measure 和历史 MV 依赖。
+40. 如果 Candidate 只由未来复用价值触发，而没有当前 batch 的 Query 或 QueryFamily 依据，evaluate 必须删除该 Candidate 或改为 `decision = "skip"`。
+41. evaluate 阶段必须检查 `column_mappings` 是否覆盖所有 `output_columns`，且 `source_table.source_column` 来自物理表字段。
 
 # 示例 1：q42/q52 生成 fine-grain aggregate superset MV
 
@@ -100,10 +102,12 @@ GROUP BY
       "mv_id": "mv_ss_dd_item_q42_q52_fg",
       "source_batch_id": 3,
       "source_query_ids": ["q42", "q52"],
+      "source_qb_ids": ["q42.outer", "q52.outer"],
       "family_id": "family_ss_dd_item",
       "mv_type": "fine_grain_aggregate",
       "target_table_name": "mv_ss_dd_item_q42_q52_fg",
       "target_queries": ["q42", "q52"],
+      "target_qb_ids": ["q42.outer", "q52.outer"],
       "depends_on_mv_ids": [],
       "mv_predicates": [
         "item.i_manager_id = 1",

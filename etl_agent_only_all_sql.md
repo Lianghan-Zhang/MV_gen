@@ -839,7 +839,7 @@ output_artifact_path
 | `BatchMVAgent` | historical rewrite SQL、原始 QueryBlock、原始 QueryFamily、当前 batch 的 `family_groups`、`materialized_mvs.json`、全局 `complexity_batches.json` 和 `query_families.json` 只读上下文 | 当前 batch 的 MV Candidate JSON、MV build SQL |
 | `ExecutorAgent.materialize_mvs(...)` | MV Candidate JSON、MV build SQL | 成功物化的 MV 追加到 `materialized_mvs.json`；skip / failed Candidate 写入 run log |
 | `ExecutorAgent.run_queries(...)` | final rewrite SQL、rewrite meta、ComplexityBatch | dry-run execution order JSON、run log |
-| `CoverageSummaryBuilder` | SQL manifest、Feature status、QueryBlock、QueryFamily、ComplexityBatch、MV Candidate、rewrite meta、execution order、run log | `{run_id}/06_execution_logs/coverage_summary.json` |
+| `CoverageSummaryBuilder` | SQL manifest、Feature status、QueryBlock、QueryFamily、ComplexityBatch、MV Candidate、rewrite meta、execution order、run log | `{run_id}/08_coverage/coverage_summary.json` |
 | `SelfIterationAgent` | `run_log.jsonl`、`coverage_summary.json`、`family_candidates.json`、MV Candidate、rewrite meta、execution order | `{run_id}/07_feedback/feedback_rules_{run_id}.json` |
 
 ## 5. 通用 LLM + Rules Prompt 模板

@@ -126,6 +126,7 @@ class BatchClusterAgent(LLMRulesAgent):
             for family in query_families
         }
         qb_to_query = {block["qb_id"]: block["query_id"] for block in query_blocks}
+        unsupported_qb_ids = {block["qb_id"] for block in query_blocks if block.get("unsupported_reasons")}
         for batch in output["complexity_batches"]:
             batch_queries = set(batch["query_ids"])
             for group in batch.get("family_groups", []):
@@ -134,6 +135,8 @@ class BatchClusterAgent(LLMRulesAgent):
                     raise ValueError(f"Unknown family_id in family_groups: {family_id}")
                 if not set(group["qb_ids"]).issubset(family_members[family_id]):
                     raise ValueError(f"family_group {family_id} contains qb_ids outside its QueryFamily")
+                if set(group["qb_ids"]) & unsupported_qb_ids:
+                    raise ValueError(f"family_group {family_id} contains unsupported QueryBlock")
                 derived_query_ids = {qb_to_query[qb_id] for qb_id in group["qb_ids"] if qb_id in qb_to_query}
                 if set(group["query_ids"]) != derived_query_ids:
                     raise ValueError(f"family_group {family_id} query_ids do not match qb_ids")
@@ -149,11 +152,17 @@ class BatchClusterAgent(LLMRulesAgent):
         expected: dict[str, int] = {}
         for query_id, qb_ids in query_to_qbs.items():
             complexity_type = "join"
+            has_usable_qb = False
             for qb_id in qb_ids:
-                block_type = block_by_id[qb_id]["complexity_type"]
+                block = block_by_id[qb_id]
+                if block.get("unsupported_reasons"):
+                    continue
+                has_usable_qb = True
+                block_type = block["complexity_type"]
                 if self.COMPLEXITY_RANK[block_type] > self.COMPLEXITY_RANK[complexity_type]:
                     complexity_type = block_type
-            expected[query_id] = self.BATCH_BY_TYPE[complexity_type]
+            if has_usable_qb:
+                expected[query_id] = self.BATCH_BY_TYPE[complexity_type]
         return expected
 
     def _dedupe(self, values: list[str]) -> list[str]:

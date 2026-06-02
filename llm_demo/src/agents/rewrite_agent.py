@@ -80,7 +80,7 @@ class RewriteAgent(LLMRulesAgent):
                 batch_id=batch_id,
             )
         output = self._apply_safety_fallbacks(output, materialized_mvs, queries, rewrite_stage)
-        self._validate_output(output, current_batch, materialized_mvs, batch_id, rewrite_stage)
+        self._validate_output(output, current_batch, materialized_mvs, query_blocks["query_blocks"], batch_id, rewrite_stage)
 
         rewrite_dir_relative = f"05_rewritten_sql/batch_{batch_id}/{rewrite_stage}_rewrite"
         rewrite_dir = self.store.ensure_dir(rewrite_dir_relative)
@@ -149,6 +149,7 @@ class RewriteAgent(LLMRulesAgent):
         output: dict[str, Any],
         current_batch: dict[str, Any],
         materialized_mvs: dict[str, Any],
+        query_blocks: list[dict[str, Any]],
         batch_id: int,
         rewrite_stage: str,
     ) -> None:
@@ -162,6 +163,8 @@ class RewriteAgent(LLMRulesAgent):
             for mv in materialized_mvs.get("materialized_mvs", [])
             if mv.get("available_from_batch", batch_id) <= batch_id
         }
+        qb_by_id = {block["qb_id"]: block for block in query_blocks}
+        unsupported_qb_ids = {block["qb_id"] for block in query_blocks if block.get("unsupported_reasons")}
         for record in output["rewrites"]:
             if record["rewrite_stage"] != rewrite_stage:
                 raise ValueError(f"Rewrite record {record['query_id']} has wrong rewrite_stage")
@@ -178,6 +181,28 @@ class RewriteAgent(LLMRulesAgent):
                     raise ValueError(f"Rewritten query {record['query_id']} uses unavailable MV {used_mv_ids - available_mv_ids}")
                 if record.get("fallback_reason") is not None:
                     raise ValueError(f"Rewritten query {record['query_id']} must have fallback_reason=null")
+            self._validate_target_qbs(record, qb_by_id, unsupported_qb_ids)
+
+    def _validate_target_qbs(
+        self,
+        record: dict[str, Any],
+        qb_by_id: dict[str, dict[str, Any]],
+        unsupported_qb_ids: set[str],
+    ) -> None:
+        target_qb_ids = record.get("target_qb_ids", [])
+        if "query_block" not in record.get("rewrite_mode", "") and not target_qb_ids:
+            return
+        if record["status"] == "rewritten" and not target_qb_ids and "query_block" in record.get("rewrite_mode", ""):
+            raise ValueError(f"QueryBlock-local rewrite {record['query_id']} must include target_qb_ids")
+        unknown = [qb_id for qb_id in target_qb_ids if qb_id not in qb_by_id]
+        if unknown:
+            raise ValueError(f"Rewrite record {record['query_id']} target_qb_ids contain unknown QueryBlock {unknown}")
+        unsupported = [qb_id for qb_id in target_qb_ids if qb_id in unsupported_qb_ids]
+        if unsupported:
+            raise ValueError(f"Rewrite record {record['query_id']} target_qb_ids contain unsupported QueryBlock {unsupported}")
+        outside_query = [qb_id for qb_id in target_qb_ids if qb_by_id[qb_id]["query_id"] != record["query_id"]]
+        if outside_query:
+            raise ValueError(f"Rewrite record {record['query_id']} target_qb_ids point outside query: {outside_query}")
 
     def _apply_safety_fallbacks(
         self,

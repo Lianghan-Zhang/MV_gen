@@ -228,7 +228,7 @@
 
 - [ ] 代码实现，不调用 LLM。
 - [ ] 输入已有 artifact 和 run log。
-- [ ] 输出 `06_execution_logs/coverage_summary.json`。
+- [ ] 输出 `08_coverage/coverage_summary.json`。
 - [ ] 汇总：
   - SQL manifest 覆盖
   - Feature success / partial_success / failed / unsupported
@@ -286,7 +286,7 @@
 - [ ] `05_rewritten_sql/batch_{batch_id}/final_rewrite/{query_id}_rewritten.sql`
 - [ ] `05_rewritten_sql/batch_{batch_id}/final_rewrite/{query_id}_rewrite_meta.json`
 - [ ] `06_execution_logs/batch_{batch_id}_execution_order.json`
-- [ ] `06_execution_logs/coverage_summary.json`
+- [ ] `08_coverage/coverage_summary.json`
 - [ ] `06_execution_logs/run_log.jsonl`
 - [ ] `07_feedback/feedback_rules_{run_id}.json`
 

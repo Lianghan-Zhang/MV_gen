@@ -16,7 +16,11 @@ from llm_demo.src.agents.rewrite_agent import RewriteAgent
 from llm_demo.src.agents.self_iteration_agent import SelfIterationAgent
 from llm_demo.src.agents.sql_loader_agent import SQLLoaderAgent
 from llm_demo.src.core.artifact_store import ArtifactStore
+from llm_demo.src.core.batch_workflow_runner import BatchWorkflowRunner
+from llm_demo.src.core.coverage_summary_builder import CoverageSummaryBuilder
+from llm_demo.src.core.family_candidate_builder import FamilyCandidateBuilder
 from llm_demo.src.core.llm_client import LLMClient
+from llm_demo.src.core.query_analysis_runner import QueryAnalysisRunner
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -271,6 +275,105 @@ def test_sql_loader_writes_manifest_and_run_log() -> None:
     assert records[0]["output_artifact_paths"] == [str(manifest_path)]
 
 
+def test_sql_loader_accepts_workflow_directory_with_stable_manifest_order() -> None:
+    store = make_store("test_sql_loader_directory")
+    manifest_path = SQLLoaderAgent(store).run(PROJECT_ROOT / "tpcds-spark")
+
+    manifest = store.read_json(manifest_path)
+    query_ids = [query["query_id"] for query in manifest["queries"]]
+    assert len(query_ids) > len(SQL_PATHS)
+    assert query_ids == sorted(query_ids)
+    assert "sql_text" not in manifest["queries"][0]
+    assert not any((store.path("00_raw_sql") / f"{query_id}.sql").exists() for query_id in query_ids[:3])
+
+
+def feature_output(query_id: str, unsupported_reasons: list[str] | None = None) -> dict:
+    return {
+        "query_blocks": [
+            {
+                "qb_id": f"{query_id}.outer",
+                "query_id": query_id,
+                "block_name": "outer",
+                "scope_type": "outer",
+                "parent_qb_id": None,
+                "depends_on_qb_ids": [],
+                "structural_flags": [],
+                "tables": ["date_dim", "store_sales", "item"],
+                "join_edges": [
+                    "date_dim.d_date_sk = store_sales.ss_sold_date_sk",
+                    "store_sales.ss_item_sk = item.i_item_sk",
+                ],
+                "predicates": ["date_dim.d_year = 2000"],
+                "group_by_exprs": ["date_dim.d_year"],
+                "aggregate_exprs": ["SUM(store_sales.ss_ext_sales_price)"],
+                "complexity_type": "join_filter_groupby",
+                "family_key": "store_sales-date_dim-item",
+                "unsupported_reasons": unsupported_reasons or [],
+            }
+        ],
+        "query_to_qbs": {query_id: [f"{query_id}.outer"]},
+        "qb_to_query": {f"{query_id}.outer": query_id},
+    }
+
+
+def test_query_analysis_runner_serial_retry_and_resume_feature() -> None:
+    class ScriptedFeatureAgent:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        def extract_one(self, query: dict, attempt: int = 1) -> dict:
+            self.calls.append((query["query_id"], attempt))
+            if query["query_id"] == "q52" and attempt == 1:
+                raise RuntimeError("transient LLM timeout")
+            return feature_output(query["query_id"])
+
+    store = make_store("test_query_analysis_runner")
+    manifest_path = SQLLoaderAgent(store).run(SQL_PATHS)
+    feature_agent = ScriptedFeatureAgent()
+
+    query_blocks_path = QueryAnalysisRunner(store, feature_agent).run_all(manifest_path)
+
+    assert feature_agent.calls == [("q42", 1), ("q52", 1), ("q52", 2)]
+    assert query_blocks_path == store.query_blocks_path
+    status = store.read_json(store.feature_status_path)
+    assert {item["query_id"]: item["status"] for item in status["queries"]} == {"q42": "success", "q52": "success"}
+    assert store.read_json(store.query_to_qbs_path) == {"q42": ["q42.outer"], "q52": ["q52.outer"]}
+    assert store.read_json(store.qb_to_query_path) == {"q42.outer": "q42", "q52.outer": "q52"}
+
+    class FailingFeatureAgent:
+        def extract_one(self, query: dict, attempt: int = 1) -> dict:
+            raise AssertionError("resume_feature should skip successful queries")
+
+    QueryAnalysisRunner(store, FailingFeatureAgent()).run_all(manifest_path, resume_feature=True)
+
+
+def test_family_candidate_builder_groups_query_blocks_without_pair_matrix() -> None:
+    store = make_store("test_family_candidate_builder")
+    query_blocks_path = store.write_json(
+        "01_query_blocks/query_blocks.json",
+        {
+            "query_blocks": [
+                feature_output("q42")["query_blocks"][0],
+                feature_output("q52")["query_blocks"][0],
+                {
+                    **feature_output("q_bad", ["has_correlated_subquery"])["query_blocks"][0],
+                    "tables": ["date_dim", "store_sales", "item"],
+                },
+            ]
+        },
+    )
+
+    candidates_path = FamilyCandidateBuilder(store).run(query_blocks_path)
+    candidates = store.read_json(candidates_path)["family_candidates"]
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["core_fact_table_set"] == ["store_sales"]
+    assert {member["qb_id"] for member in candidate["members"]} == {"q42.outer", "q52.outer"}
+    assert candidate["unsupported_qb_ids"] == ["q_bad.outer"]
+    assert len(candidate["pair_evidence"]) == 1
+
+
 def test_executor_agent_dry_run_materializes_available_mvs_and_orders_queries() -> None:
     store = make_store("test_executor_dry_run")
     batches_path = write_minimal_complexity_batches(store, 3, "join_filter_groupby", ["q52", "q42"])
@@ -284,10 +387,12 @@ def test_executor_agent_dry_run_materializes_available_mvs_and_orders_queries() 
                     "mv_id": "mv_ok",
                     "source_batch_id": 3,
                     "source_query_ids": ["q42"],
+                    "source_qb_ids": ["q42.outer"],
                     "family_id": "family_ss_dd_item",
                     "mv_type": "fine_grain_aggregate",
                     "target_table_name": "mv_ok",
                     "target_queries": ["q42"],
+                    "target_qb_ids": ["q42.outer"],
                     "depends_on_mv_ids": [],
                     "group_by_exprs": ["date_dim.d_year"],
                     "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ss_ext_sales_price"],
@@ -317,9 +422,11 @@ def test_executor_agent_dry_run_materializes_available_mvs_and_orders_queries() 
                     "mv_id": "mv_missing_dep",
                     "source_batch_id": 3,
                     "source_query_ids": ["q52"],
+                    "source_qb_ids": ["q52.outer"],
                     "family_id": "family_ss_dd_item",
                     "target_table_name": "mv_missing_dep",
                     "target_queries": ["q52"],
+                    "target_qb_ids": ["q52.outer"],
                     "depends_on_mv_ids": ["mv_not_available"],
                     "build_sql": "CREATE TABLE mv_missing_dep AS SELECT 1",
                     "decision": "materialize",
@@ -384,6 +491,42 @@ def test_executor_agent_requires_used_mv_ids_in_rewrite_meta() -> None:
         ExecutorAgent(store).run_queries(3, final_rewrite_dir, batches_path)
 
 
+def test_coverage_summary_builder_handles_partial_artifacts() -> None:
+    store = make_store("test_coverage_summary")
+    SQLLoaderAgent(store).run(SQL_PATHS)
+    store.write_json(
+        "01_query_blocks/feature_extract_status.json",
+        {
+            "run_id": store.run_id,
+            "queries": [
+                {"query_id": "q42", "status": "success", "attempts": 1, "qb_ids": ["q42.outer"]},
+                {
+                    "query_id": "q52",
+                    "status": "feature_failed",
+                    "attempts": 2,
+                    "qb_ids": [],
+                    "error_type": "RuntimeError",
+                    "error_message": "timeout",
+                },
+            ],
+        },
+    )
+    store.write_json("02_families/family_candidates.json", {"family_candidates": [{"candidate_family_id": "candidate_1"}]})
+    store.write_json("02_families/query_families.json", {"query_families": [{"family_id": "family_1", "members": ["q42.outer"]}]})
+    write_minimal_complexity_batches(store, 3, "join_filter_groupby", ["q42"])
+
+    coverage_path = CoverageSummaryBuilder(store).run()
+    coverage = store.read_json(coverage_path)
+
+    assert coverage["run_id"] == store.run_id
+    assert coverage["total_queries"] == 2
+    assert coverage["feature_status_counts"] == {"success": 1, "feature_failed": 1}
+    assert coverage["family_candidate_count"] == 1
+    assert coverage["family_count"] == 1
+    assert coverage["batch_query_counts"]["3"] == 1
+    assert coverage["notes"] == ["feature_failed_or_unsupported_queries=1"]
+
+
 def test_batch_mv_agent_rejects_materialize_candidate_without_column_mappings() -> None:
     store = make_store("test_batch_mv_missing_mappings")
     batches_path, query_blocks_path, families_path, historical_rewrite_dir = write_minimal_batch_mv_inputs(store, ["q42"])
@@ -394,8 +537,10 @@ def test_batch_mv_agent_rejects_materialize_candidate_without_column_mappings() 
                 "candidate_id": "cand_missing_mappings",
                 "source_batch_id": 3,
                 "source_query_ids": ["q42"],
+                "source_qb_ids": ["q42.outer"],
                 "family_id": "family_ss_dd_item",
                 "target_queries": ["q42"],
+                "target_qb_ids": ["q42.outer"],
                 "decision": "materialize",
                 "reason": "test",
                 "mv_id": "mv_missing_mappings",
@@ -430,8 +575,10 @@ def test_batch_mv_agent_rejects_dotted_mv_output_columns() -> None:
                 "candidate_id": "cand_dotted_columns",
                 "source_batch_id": 3,
                 "source_query_ids": ["q42"],
+                "source_qb_ids": ["q42.outer"],
                 "family_id": "family_ss_dd_item",
                 "target_queries": ["q42"],
+                "target_qb_ids": ["q42.outer"],
                 "decision": "materialize",
                 "reason": "test",
                 "mv_id": "mv_dotted_columns",
@@ -465,7 +612,7 @@ def test_batch_mv_agent_rejects_dotted_mv_output_columns() -> None:
         )
 
 
-def test_batch_mv_agent_normalizes_create_or_replace_to_create_table() -> None:
+def test_batch_mv_agent_rejects_create_or_replace_table() -> None:
     store = make_store("test_batch_mv_create_table")
     batches_path, query_blocks_path, families_path, historical_rewrite_dir = write_minimal_batch_mv_inputs(store, ["q42"])
     output = {
@@ -475,8 +622,10 @@ def test_batch_mv_agent_normalizes_create_or_replace_to_create_table() -> None:
                 "candidate_id": "cand_create_table",
                 "source_batch_id": 3,
                 "source_query_ids": ["q42"],
+                "source_qb_ids": ["q42.outer"],
                 "family_id": "family_ss_dd_item",
                 "target_queries": ["q42"],
+                "target_qb_ids": ["q42.outer"],
                 "decision": "materialize",
                 "reason": "test",
                 "mv_id": "mv_create_table",
@@ -500,20 +649,14 @@ def test_batch_mv_agent_normalizes_create_or_replace_to_create_table() -> None:
         ],
     }
 
-    mv_candidates_path = BatchMVAgent(store, StaticLLM([output, output])).run(
-        3,
-        batches_path,
-        query_blocks_path,
-        families_path,
-        historical_rewrite_dir,
-    )
-
-    candidate = store.read_json(mv_candidates_path)["mv_candidates"][0]
-    mv_build_sql = store.read_text(store.path("04_batch_mvs/batch_3_mv_build.sql"))
-    assert candidate["build_sql"].startswith("CREATE TABLE mv_create_table")
-    assert "CREATE OR REPLACE TABLE" not in candidate["build_sql"].upper()
-    assert "CREATE TABLE mv_create_table" in mv_build_sql
-    assert "CREATE OR REPLACE TABLE" not in mv_build_sql.upper()
+    with pytest.raises(ValueError, match="CREATE OR REPLACE TABLE"):
+        BatchMVAgent(store, StaticLLM([output, output])).run(
+            3,
+            batches_path,
+            query_blocks_path,
+            families_path,
+            historical_rewrite_dir,
+        )
 
 
 def test_batch_mv_agent_rejects_measure_alias_without_source_column_prefix() -> None:
@@ -526,8 +669,10 @@ def test_batch_mv_agent_rejects_measure_alias_without_source_column_prefix() -> 
                 "candidate_id": "cand_bad_measure_alias",
                 "source_batch_id": 3,
                 "source_query_ids": ["q42"],
+                "source_qb_ids": ["q42.outer"],
                 "family_id": "family_ss_dd_item",
                 "target_queries": ["q42"],
+                "target_qb_ids": ["q42.outer"],
                 "decision": "materialize",
                 "reason": "test",
                 "mv_id": "mv_bad_measure_alias",
@@ -569,6 +714,118 @@ def test_batch_mv_agent_rejects_measure_alias_without_source_column_prefix() -> 
             query_blocks_path,
             families_path,
             historical_rewrite_dir,
+        )
+
+
+def test_batch_mv_agent_rejects_unsupported_source_query_block() -> None:
+    store = make_store("test_batch_mv_unsupported_qb")
+    batches_path, query_blocks_path, families_path, historical_rewrite_dir = write_minimal_batch_mv_inputs(store, ["q42"])
+    query_blocks = store.read_json(query_blocks_path)
+    query_blocks["query_blocks"][0]["unsupported_reasons"] = ["has_correlated_subquery"]
+    store.write_json("01_query_blocks/query_blocks.json", query_blocks)
+    output = {
+        "batch_id": 3,
+        "mv_candidates": [
+            {
+                "candidate_id": "cand_unsupported_qb",
+                "source_batch_id": 3,
+                "source_query_ids": ["q42"],
+                "source_qb_ids": ["q42.outer"],
+                "family_id": "family_ss_dd_item",
+                "target_queries": ["q42"],
+                "target_qb_ids": ["q42.outer"],
+                "decision": "materialize",
+                "reason": "test",
+                "mv_id": "mv_unsupported_qb",
+                "mv_type": "fine_grain_aggregate",
+                "target_table_name": "mv_unsupported_qb",
+                "depends_on_mv_ids": [],
+                "output_columns": ["d_year"],
+                "column_mappings": [
+                    {
+                        "source_expr": "date_dim.d_year",
+                        "source_table": "date_dim",
+                        "source_column": "d_year",
+                        "mv_column": "d_year",
+                        "role": "dimension",
+                    }
+                ],
+                "group_by_exprs": ["date_dim.d_year"],
+                "measure_exprs": [],
+                "build_sql": "CREATE TABLE mv_unsupported_qb AS SELECT date_dim.d_year FROM date_dim",
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="unsupported QueryBlock"):
+        BatchMVAgent(store, StaticLLM([output, output])).run(
+            3,
+            batches_path,
+            query_blocks_path,
+            families_path,
+            historical_rewrite_dir,
+        )
+
+
+def test_batch_mv_agent_rejects_mv_dependency_cycle() -> None:
+    store = make_store("test_batch_mv_dependency_cycle")
+    batches_path, query_blocks_path, families_path, historical_rewrite_dir = write_minimal_batch_mv_inputs(store, ["q42"])
+    materialized_mvs_path = store.write_json(
+        "04_batch_mvs/materialized_mvs.json",
+        {
+            "materialized_mvs": [
+                {
+                    "mv_id": "mv_parent",
+                    "available_from_batch": 2,
+                    "depends_on_mv_ids": ["mv_cycle"],
+                    "output_columns": ["d_year"],
+                    "column_mappings": [],
+                }
+            ]
+        },
+    )
+    output = {
+        "batch_id": 3,
+        "mv_candidates": [
+            {
+                "candidate_id": "cand_cycle",
+                "source_batch_id": 3,
+                "source_query_ids": ["q42"],
+                "source_qb_ids": ["q42.outer"],
+                "family_id": "family_ss_dd_item",
+                "target_queries": ["q42"],
+                "target_qb_ids": ["q42.outer"],
+                "decision": "materialize",
+                "reason": "test",
+                "mv_id": "mv_cycle",
+                "mv_type": "fine_grain_aggregate",
+                "target_table_name": "mv_cycle",
+                "depends_on_mv_ids": ["mv_parent"],
+                "output_columns": ["d_year"],
+                "column_mappings": [
+                    {
+                        "source_expr": "date_dim.d_year",
+                        "source_table": "date_dim",
+                        "source_column": "d_year",
+                        "mv_column": "d_year",
+                        "role": "dimension",
+                    }
+                ],
+                "group_by_exprs": ["date_dim.d_year"],
+                "measure_exprs": [],
+                "build_sql": "CREATE TABLE mv_cycle AS SELECT date_dim.d_year FROM date_dim",
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="dependency cycle"):
+        BatchMVAgent(store, StaticLLM([output, output])).run(
+            3,
+            batches_path,
+            query_blocks_path,
+            families_path,
+            historical_rewrite_dir,
+            materialized_mvs_path,
         )
 
 
@@ -831,6 +1088,8 @@ def test_live_batch_cluster_batch_mv_and_self_iteration_agents_produce_artifacts
         assert set(candidate["target_queries"]).issubset(set(target_batch["query_ids"]))
         assert not any(query_id.startswith("downstream") for query_id in candidate["target_queries"])
         if candidate["decision"] == "materialize":
+            assert candidate["source_qb_ids"]
+            assert candidate["target_qb_ids"]
             assert candidate["build_sql"].upper().startswith("CREATE TABLE")
             assert "CREATE OR REPLACE TABLE" not in candidate["build_sql"].upper()
             assert candidate["column_mappings"]
@@ -1026,9 +1285,10 @@ def test_notebook_skeleton_documents_first_flow() -> None:
     assert "ArtifactStore" in source
     assert "SQLLoaderAgent" in source
     assert "FeatureAgent" in source
+    assert "QueryAnalysisRunner" in source
+    assert "FamilyCandidateBuilder" in source
     assert "FamilyAgent" in source
     assert "BatchClusterAgent" in source
-    assert "BatchMVAgent" in source
-    assert "RewriteAgent" in source
-    assert "ExecutorAgent" in source
+    assert "BatchWorkflowRunner" in source
+    assert "CoverageSummaryBuilder" in source
     assert "SelfIterationAgent" in source

@@ -26,6 +26,58 @@ class ArtifactStore:
     def run_log_path(self) -> Path:
         return self.run_dir / "06_execution_logs" / "run_log.jsonl"
 
+    @property
+    def sql_manifest_path(self) -> Path:
+        return self.path("00_raw_sql/sql_manifest.json")
+
+    @property
+    def query_blocks_path(self) -> Path:
+        return self.path("01_query_blocks/query_blocks.json")
+
+    @property
+    def query_to_qbs_path(self) -> Path:
+        return self.path("01_query_blocks/query_to_qbs.json")
+
+    @property
+    def qb_to_query_path(self) -> Path:
+        return self.path("01_query_blocks/qb_to_query.json")
+
+    @property
+    def feature_status_path(self) -> Path:
+        return self.path("01_query_blocks/feature_extract_status.json")
+
+    @property
+    def family_candidates_path(self) -> Path:
+        return self.path("02_families/family_candidates.json")
+
+    @property
+    def query_families_path(self) -> Path:
+        return self.path("02_families/query_families.json")
+
+    @property
+    def complexity_batches_path(self) -> Path:
+        return self.path("03_batches/complexity_batches.json")
+
+    @property
+    def materialized_mvs_path(self) -> Path:
+        return self.path("04_batch_mvs/materialized_mvs.json")
+
+    @property
+    def coverage_summary_path(self) -> Path:
+        return self.path("08_coverage/coverage_summary.json")
+
+    def batch_mv_candidates_path(self, batch_id: int) -> Path:
+        return self.path(f"04_batch_mvs/batch_{batch_id}_mv_candidates.json")
+
+    def batch_mv_build_sql_path(self, batch_id: int) -> Path:
+        return self.path(f"04_batch_mvs/batch_{batch_id}_mv_build.sql")
+
+    def rewrite_dir(self, batch_id: int, rewrite_stage: str) -> Path:
+        return self.path(f"05_rewritten_sql/batch_{batch_id}/{rewrite_stage}_rewrite")
+
+    def execution_order_path(self, batch_id: int) -> Path:
+        return self.path(f"06_execution_logs/batch_{batch_id}_execution_order.json")
+
     def path(self, relative_path: str | Path) -> Path:
         return self.run_dir / Path(relative_path)
 

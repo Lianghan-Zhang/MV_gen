@@ -11,9 +11,9 @@ from llm_demo.src.core.llm_client import LLMClient
 from llm_demo.src.core.physical_schema import load_physical_schema, validate_physical_column
 from llm_demo.src.core.schemas import BatchMVOutput
 from llm_demo.src.core.sql_utils import (
+    assert_create_table_as_select,
     aggregate_measure_column_name,
     create_table_select_output_names,
-    normalize_create_table_as_select,
 )
 
 
@@ -74,8 +74,15 @@ class BatchMVAgent(LLMRulesAgent):
             input_artifacts={**input_artifacts, "candidate_mv_output": candidate_output},
             output_model=BatchMVOutput,
         )
-        self._normalize_materialize_build_sql(output)
-        self._validate_output(output, current_batch, families["query_families"], materialized_mvs, batch_id)
+        self._validate_output(
+            output,
+            current_batch,
+            families["query_families"],
+            materialized_mvs,
+            batch_id,
+            query_blocks["query_blocks"],
+            query_to_qbs,
+        )
 
         mv_candidates_path = self.store.write_json(f"04_batch_mvs/batch_{batch_id}_mv_candidates.json", output)
         mv_build_path = self.store.write_text(
@@ -141,19 +148,33 @@ class BatchMVAgent(LLMRulesAgent):
         query_families: list[dict[str, Any]],
         materialized_mvs: dict[str, Any],
         batch_id: int,
+        query_blocks: list[dict[str, Any]],
+        query_to_qbs: dict[str, list[str]],
     ) -> None:
         if output["batch_id"] != batch_id:
             raise ValueError(f"BatchMVOutput batch_id {output['batch_id']} does not match {batch_id}")
 
         batch_queries = set(current_batch.get("query_ids", []))
         family_ids = {family["family_id"] for family in query_families}
+        family_members = {family["family_id"]: set(family.get("members", [])) for family in query_families}
         current_batch_family_ids = {group["family_id"] for group in current_batch.get("family_groups", [])}
         available_mv_ids = {
             mv["mv_id"]
             for mv in materialized_mvs.get("materialized_mvs", [])
             if mv.get("available_from_batch", batch_id) <= batch_id
         }
+        existing_mv_ids = {
+            mv["mv_id"]
+            for mv in materialized_mvs.get("materialized_mvs", [])
+            if mv.get("mv_id")
+        }
         physical_schema = load_physical_schema(self.store.project_root)
+        qb_by_id = {block["qb_id"]: block for block in query_blocks}
+        unsupported_qb_ids = {
+            block["qb_id"]
+            for block in query_blocks
+            if block.get("unsupported_reasons")
+        }
         seen_candidate_ids: set[str] = set()
         for candidate in output["mv_candidates"]:
             candidate_id = candidate["candidate_id"]
@@ -175,13 +196,24 @@ class BatchMVAgent(LLMRulesAgent):
                 raise ValueError(f"Candidate {candidate_id} source_query_ids must belong to current batch")
             if not set(candidate["target_queries"]).issubset(batch_queries):
                 raise ValueError(f"Candidate {candidate_id} target_queries must belong to current batch")
+            self._validate_candidate_qbs(
+                candidate=candidate,
+                qb_by_id=qb_by_id,
+                unsupported_qb_ids=unsupported_qb_ids,
+                query_to_qbs=query_to_qbs,
+                family_members=family_members[candidate["family_id"]],
+                require_qb_ids=candidate["decision"] == "materialize",
+            )
 
             mv_id = candidate.get("mv_id")
+            if mv_id and mv_id in existing_mv_ids:
+                raise ValueError(f"Candidate {candidate_id} mv_id already exists: {mv_id}")
             for dependency in candidate.get("depends_on_mv_ids", []):
                 if dependency == mv_id:
                     raise ValueError(f"Candidate {candidate_id} cannot depend on itself")
                 if dependency not in available_mv_ids:
                     raise ValueError(f"Candidate {candidate_id} depends on unavailable MV {dependency}")
+            self._validate_mv_dependency_graph(candidate, materialized_mvs)
 
             if candidate["decision"] == "materialize":
                 missing = [
@@ -192,6 +224,71 @@ class BatchMVAgent(LLMRulesAgent):
                 if missing:
                     raise ValueError(f"Candidate {candidate_id} decision=materialize missing {missing}")
                 self._validate_materialized_columns(candidate, physical_schema)
+
+    def _validate_candidate_qbs(
+        self,
+        *,
+        candidate: dict[str, Any],
+        qb_by_id: dict[str, dict[str, Any]],
+        unsupported_qb_ids: set[str],
+        query_to_qbs: dict[str, list[str]],
+        family_members: set[str],
+        require_qb_ids: bool,
+    ) -> None:
+        candidate_id = candidate["candidate_id"]
+        source_qb_ids = candidate.get("source_qb_ids", [])
+        target_qb_ids = candidate.get("target_qb_ids", [])
+        if require_qb_ids and (not source_qb_ids or not target_qb_ids):
+            raise ValueError(f"Candidate {candidate_id} decision=materialize requires source_qb_ids and target_qb_ids")
+
+        for field_name, qb_ids, query_ids in (
+            ("source_qb_ids", source_qb_ids, candidate["source_query_ids"]),
+            ("target_qb_ids", target_qb_ids, candidate["target_queries"]),
+        ):
+            unknown_qbs = [qb_id for qb_id in qb_ids if qb_id not in qb_by_id]
+            if unknown_qbs:
+                raise ValueError(f"Candidate {candidate_id} {field_name} contains unknown QueryBlock {unknown_qbs}")
+            unsupported = [qb_id for qb_id in qb_ids if qb_id in unsupported_qb_ids]
+            if unsupported:
+                raise ValueError(f"Candidate {candidate_id} {field_name} contains unsupported QueryBlock {unsupported}")
+            outside_family = [qb_id for qb_id in qb_ids if qb_id not in family_members]
+            if outside_family:
+                raise ValueError(f"Candidate {candidate_id} {field_name} must belong to candidate family: {outside_family}")
+            allowed_qbs = {
+                qb_id
+                for query_id in query_ids
+                for qb_id in query_to_qbs.get(query_id, [])
+            }
+            outside_queries = [qb_id for qb_id in qb_ids if qb_id not in allowed_qbs]
+            if outside_queries:
+                raise ValueError(f"Candidate {candidate_id} {field_name} do not match query ids: {outside_queries}")
+
+    def _validate_mv_dependency_graph(self, candidate: dict[str, Any], materialized_mvs: dict[str, Any]) -> None:
+        mv_id = candidate.get("mv_id")
+        if not mv_id:
+            return
+        graph = {
+            mv["mv_id"]: list(mv.get("depends_on_mv_ids", []))
+            for mv in materialized_mvs.get("materialized_mvs", [])
+            if mv.get("mv_id")
+        }
+        graph[mv_id] = list(candidate.get("depends_on_mv_ids", []))
+        visited: set[str] = set()
+        visiting: set[str] = set()
+
+        def visit(current_mv_id: str) -> None:
+            if current_mv_id in visiting:
+                raise ValueError(f"Candidate {candidate['candidate_id']} creates an MV dependency cycle")
+            if current_mv_id in visited:
+                return
+            visiting.add(current_mv_id)
+            for dependency in graph.get(current_mv_id, []):
+                if dependency in graph:
+                    visit(dependency)
+            visiting.remove(current_mv_id)
+            visited.add(current_mv_id)
+
+        visit(mv_id)
 
     def _validate_materialized_columns(self, candidate: dict[str, Any], physical_schema: dict[str, set[str]]) -> None:
         candidate_id = candidate["candidate_id"]
@@ -210,6 +307,7 @@ class BatchMVAgent(LLMRulesAgent):
             raise ValueError(f"Candidate {candidate_id} output_columns missing column_mappings for {missing_mappings}")
 
         build_sql = candidate.get("build_sql") or ""
+        assert_create_table_as_select(build_sql)
         build_output_columns = create_table_select_output_names(build_sql)
         non_measure_counts = Counter(
             mapping["source_column"]
@@ -238,11 +336,6 @@ class BatchMVAgent(LLMRulesAgent):
             return f"{mapping['source_table']}_{source_column}"
         return source_column
 
-    def _normalize_materialize_build_sql(self, output: dict[str, Any]) -> None:
-        for candidate in output["mv_candidates"]:
-            if candidate["decision"] == "materialize" and candidate.get("build_sql"):
-                candidate["build_sql"] = normalize_create_table_as_select(candidate["build_sql"])
-
     def _render_build_sql(self, output: dict[str, Any]) -> str:
         statements = []
         for candidate in output["mv_candidates"]:
@@ -267,7 +360,9 @@ class BatchMVAgent(LLMRulesAgent):
                     "decision": candidate["decision"],
                     "mv_id": candidate.get("mv_id"),
                     "source_query_ids": candidate["source_query_ids"],
+                    "source_qb_ids": candidate.get("source_qb_ids", []),
                     "target_queries": candidate["target_queries"],
+                    "target_qb_ids": candidate.get("target_qb_ids", []),
                     "reason": candidate["reason"],
                 },
             )

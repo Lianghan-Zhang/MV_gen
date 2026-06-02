@@ -1,36 +1,38 @@
 # 职责
 
-给定 QueryBlock 列表，按 upstream join-domain MV / shared superset MV 覆盖关系聚合 QueryFamily。
+给定 `family_candidates.json` 和 QueryBlock 证据，按 upstream join-domain MV / shared superset MV 覆盖关系聚合 QueryFamily。
 
 # 规则
 
 1. 聚合单位是 `qb_id`，不是完整 SQL。
-2. `members` 只保存属于该 family 的 `qb_id`。
-3. `family_id` 必须稳定、可读，优先由核心表名生成，例如 `family_ss_dd_item`。
-4. `QueryFamily` 不是简单 SQL 相似簇，而是一组可由同一个 upstream join-domain MV 或 shared superset MV 覆盖的 QueryBlock。
-5. 第一版优先保守合并；如果无法证明两个 QueryBlock 可被同一个 upstream MV 安全覆盖，保持分离。
-6. `common_tables` 记录 family 成员共同使用的物理表名。
-7. `common_join_skeleton` 记录 family 成员共同拥有或可证明等价的 join 边，必须使用物理表名，不使用 SQL alias。
-8. family candidate 第一层使用表集合量化：`Jaccard(A,B)=|T(A)∩T(B)|/|T(A)∪T(B)|` 衡量相似度，`Containment(A,B)=|T(A)∩T(B)|/min(|T(A)|,|T(B)|)` 识别宽表覆盖关系。
-9. core fact table 是 QueryBlock join domain 中承载事实记录或主要 measure 来源的中心表；TPC-DS 第一版可优先识别 `store_sales`、`catalog_sales`、`web_sales`、`store_returns`、`catalog_returns`、`web_returns`、`inventory`。
-10. candidate 分层规则：`strong candidate` = `Jaccard = 1.0`，或 `Containment = 1.0` 且 core fact table 相同；`medium candidate` = `Jaccard >= 0.6` 且 core fact table 相同，或 `Containment >= 0.8` 且较小 QueryBlock 的表集合主要被较大 join domain 覆盖；低于该阈值默认保持分离。
-11. core fact table 相同是 family 合并 hard gate；如果 core fact table 不同，即使 Jaccard / Containment 较高，也默认保持分离。
-12. 多 fact table QueryBlock 只允许与具有完全相同 core fact table set、且 join graph 可证明不会引入行数膨胀的 QueryBlock 合并；否则单独成 family。
-13. Jaccard 和 Containment 只负责生成 candidate，不直接决定最终合并。
-14. family 最终合并必须通过安全门：core fact table、join graph、predicate shape、measure compatibility 和 roll-up safety 必须可证明兼容。
-15. family 合并采用 predicate 兼容标准，不要求完整 predicate 完全相同。
-16. 第一版 predicate shape 兼容只允许两类情况：同一过滤列常量不同，例如 `date_dim.d_year = 2000` 与 `date_dim.d_year = 2001`；或者一方比另一方多出过滤条件，且多出的过滤列可在 MV 中保留并作为下游 residual filter。
-17. 如果两个 QueryBlock 的过滤列集合完全不同，例如一个只过滤 `date_dim.d_year`，另一个只过滤 `item.i_manager_id`，即使 core fact table、join graph 和 measure 兼容，也必须拆成不同 family。
-18. `common_predicates` 只记录 family 内所有成员完全相同的完整谓词，例如所有成员都有 `item.i_manager_id = 1`。
-19. `predicate_shapes` 记录同构过滤列但常量值可能不同的谓词形状，例如 `date_dim.d_year = <CONST>`。
-20. 如果两个 QueryBlock 的 join skeleton 相同或可证明等价，过滤列结构同构但常量值不同，且 measure 兼容，可以合并到同一 family。
-21. 如果过滤列集合差异过大、predicate 语义不清、join skeleton 不等价或 measure 不兼容，不能强行合并。
-22. `union_group_by_exprs` 记录 family 内所有成员 group by 表达式的并集。
-23. `union_measure_exprs` 记录 family 内所有成员 aggregate 表达式的并集。
-24. 所有表名前缀必须使用物理表名，不使用 SQL alias。
-25. FamilyAgent 需要先生成候选 QueryFamily，再进行 evaluate。
-26. evaluate 阶段必须检查是否存在重复 family、可合并 family、错误拆分、错误合并、成员 QueryBlock 归属错误、`common_predicates` 与 `predicate_shapes` 混淆等问题。
-27. evaluate 阶段输出的仍然是完整 FamilyOutput，不输出单独评审报告。
+2. 输入的 `family_candidates` 是 code-only 预筛结果，只负责压缩候选空间；最终 family 仍由 FamilyAgent evaluate / merge / split 决定。
+3. 不允许把 `candidate_family_id` 原样当作最终结论；必须检查是否需要合并、拆分、删除重复或修正成员。
+4. `members` 只保存属于该 family 的 `qb_id`。
+5. `family_id` 必须稳定、可读，优先由核心表名生成，例如 `family_ss_dd_item`。
+6. `QueryFamily` 不是简单 SQL 相似簇，而是一组可由同一个 upstream join-domain MV 或 shared superset MV 覆盖的 QueryBlock。
+7. 第一版优先保守合并；如果无法证明两个 QueryBlock 可被同一个 upstream MV 安全覆盖，保持分离。
+8. `common_tables` 记录 family 成员共同使用的物理表名。
+9. `common_join_skeleton` 记录 family 成员共同拥有或可证明等价的 join 边，必须使用物理表名，不使用 SQL alias。
+10. family candidate 第一层使用表集合量化：`Jaccard(A,B)=|T(A)∩T(B)|/|T(A)∪T(B)|` 衡量相似度，`Containment(A,B)=|T(A)∩T(B)|/min(|T(A)|,|T(B)|)` 识别宽表覆盖关系。
+11. core fact table 是 QueryBlock join domain 中承载事实记录或主要 measure 来源的中心表；TPC-DS 第一版可优先识别 `store_sales`、`catalog_sales`、`web_sales`、`store_returns`、`catalog_returns`、`web_returns`、`inventory`。
+12. candidate 分层规则：`strong candidate` = `Jaccard = 1.0`，或 `Containment = 1.0` 且 core fact table 相同；`medium candidate` = `Jaccard >= 0.6` 且 core fact table 相同，或 `Containment >= 0.8` 且较小 QueryBlock 的表集合主要被较大 join domain 覆盖；低于该阈值默认保持分离。
+13. core fact table 相同是 family 合并 hard gate；如果 core fact table 不同，即使 Jaccard / Containment 较高，也默认保持分离。
+14. 多 fact table QueryBlock 只允许与具有完全相同 core fact table set、且 join graph 可证明不会引入行数膨胀的 QueryBlock 合并；否则单独成 family。
+15. Jaccard 和 Containment 只负责生成 candidate，不直接决定最终合并。
+16. family 最终合并必须通过安全门：core fact table、join graph、predicate shape、measure compatibility 和 roll-up safety 必须可证明兼容。
+17. family 合并采用 predicate 兼容标准，不要求完整 predicate 完全相同。
+18. 第一版 predicate shape 兼容只允许两类情况：同一过滤列常量不同，例如 `date_dim.d_year = 2000` 与 `date_dim.d_year = 2001`；或者一方比另一方多出过滤条件，且多出的过滤列可在 MV 中保留并作为下游 residual filter。
+19. 如果两个 QueryBlock 的过滤列集合完全不同，例如一个只过滤 `date_dim.d_year`，另一个只过滤 `item.i_manager_id`，即使 core fact table、join graph 和 measure 兼容，也必须拆成不同 family。
+20. `common_predicates` 只记录 family 内所有成员完全相同的完整谓词，例如所有成员都有 `item.i_manager_id = 1`。
+21. `predicate_shapes` 记录同构过滤列但常量值可能不同的谓词形状，例如 `date_dim.d_year = <CONST>`。
+22. 如果两个 QueryBlock 的 join skeleton 相同或可证明等价，过滤列结构同构但常量值不同，且 measure 兼容，可以合并到同一 family。
+23. 如果过滤列集合差异过大、predicate 语义不清、join skeleton 不等价或 measure 不兼容，不能强行合并。
+24. `union_group_by_exprs` 记录 family 内所有成员 group by 表达式的并集。
+25. `union_measure_exprs` 记录 family 内所有成员 aggregate 表达式的并集。
+26. 所有表名前缀必须使用物理表名，不使用 SQL alias。
+27. FamilyAgent 需要先生成候选 QueryFamily，再进行 evaluate。
+28. evaluate 阶段必须检查是否存在重复 family、可合并 family、错误拆分、错误合并、成员 QueryBlock 归属错误、`common_predicates` 与 `predicate_shapes` 混淆等问题。
+29. evaluate 阶段输出的仍然是完整 FamilyOutput，不输出单独评审报告。
 
 # 判定流程
 

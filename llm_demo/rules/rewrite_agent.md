@@ -29,6 +29,8 @@
 23. final rewrite 必须保留 original SQL 的 `ORDER BY` 和 `LIMIT`。如果 original SQL 有排序或 limit，rewritten SQL 也必须保留对应排序项数量、排序方向和 limit 值。
 24. 如果 final rewrite 没有保留 `ORDER BY` / `LIMIT`，代码层会最多重试 2 次；仍无法修正时必须 fallback 到 original-equivalent SQL。
 25. 如果无法证明 MV 物理列覆盖、输出列名、排序和 limit 一致，必须 fallback 到 original-equivalent SQL。
+26. 如果 rewrite 只作用于 CTE / subquery 等局部 QueryBlock，`rewrite_mode` 应包含 `query_block`，并在 `target_qb_ids` 中记录被改写的 QueryBlock。
+27. `target_qb_ids` 只能指向当前 query 内、当前 Feature 输出中存在且未标记 `unsupported_reasons` 的 QueryBlock。
 
 # 输出路径约定
 
@@ -60,6 +62,7 @@ final rewrite：
       "rewritten_sql_path": "05_rewritten_sql/batch_3/final_rewrite/q42_rewritten.sql",
       "rewrite_meta_path": "05_rewritten_sql/batch_3/final_rewrite/q42_rewrite_meta.json",
       "rewrite_mode": "mv_filter_projection_rollup",
+      "target_qb_ids": ["q42.outer"],
       "rewritten_sql": "SELECT d_year, i_category_id, i_category, SUM(sum_ss_ext_sales_price) AS `sum(ss_ext_sales_price)` FROM mv_ss_dd_item_q42_q52_fg GROUP BY d_year, i_category_id, i_category ORDER BY `sum(ss_ext_sales_price)` DESC, d_year, i_category_id, i_category LIMIT 100",
       "residual_filters": [],
       "rollup_exprs": [
@@ -91,6 +94,7 @@ final rewrite：
       "rewritten_sql_path": "05_rewritten_sql/batch_3/final_rewrite/q99_rewritten.sql",
       "rewrite_meta_path": "05_rewritten_sql/batch_3/final_rewrite/q99_rewrite_meta.json",
       "rewrite_mode": "original_equivalent",
+      "target_qb_ids": [],
       "rewritten_sql": "SELECT ... FROM original_tables ...",
       "residual_filters": [],
       "rollup_exprs": [],

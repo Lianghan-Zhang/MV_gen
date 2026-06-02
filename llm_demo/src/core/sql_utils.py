@@ -22,6 +22,10 @@ def normalize_create_table_as_select(sql: str) -> str:
     return create.sql(dialect=SQL_DIALECT)
 
 
+def assert_create_table_as_select(sql: str) -> None:
+    _parse_create(sql)
+
+
 def create_table_select_output_names(sql: str) -> set[str]:
     create = _parse_create(sql)
     select = create.args.get("expression")
@@ -108,6 +112,8 @@ def _parse_create(sql: str) -> exp.Create:
     expression = _parse_sql(sql)
     if not isinstance(expression, exp.Create) or expression.args.get("kind") != "TABLE":
         raise ValueError("build_sql must start with CREATE TABLE")
+    if expression.args.get("replace"):
+        raise ValueError("build_sql must use CREATE TABLE, not CREATE OR REPLACE TABLE")
     if expression.args.get("expression") is None:
         raise ValueError("CREATE TABLE build_sql must use AS SELECT")
     return expression

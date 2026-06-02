@@ -20,9 +20,12 @@ class SelfIterationAgent(LLMRulesAgent):
         run_log_text = path.read_text(encoding="utf-8")
         run_id = self._extract_run_id(run_log_text)
         output = self._infer_structured(
-            task="读取 run_log.jsonl，输出按 target Agent 分组的 rules 反馈建议。",
+            task=(
+                "读取 run_log.jsonl 与同 run 的 coverage、family candidates、MV candidates、rewrite meta、"
+                "execution order，输出按 target Agent 分组的 rules 反馈建议。"
+            ),
             context={"run_id": run_id},
-            input_artifacts={"run_log_jsonl": run_log_text},
+            input_artifacts={"run_log_jsonl": run_log_text, **self._related_artifacts()},
             output_model=SelfIterationFeedback,
         )
         if output["run_id"] != run_id:
@@ -38,6 +41,30 @@ class SelfIterationAgent(LLMRulesAgent):
             elapsed_ms=self._elapsed_ms(started_at),
         )
         return feedback_path
+
+    def _related_artifacts(self) -> dict:
+        artifacts: dict[str, object] = {}
+        for name, path in (
+            ("coverage_summary", self.store.coverage_summary_path),
+            ("family_candidates", self.store.family_candidates_path),
+            ("query_families", self.store.query_families_path),
+        ):
+            if path.exists():
+                artifacts[name] = self.store.read_json(path)
+
+        artifacts["mv_candidates"] = [
+            self.store.read_json(path)
+            for path in sorted(self.store.run_dir.glob("04_batch_mvs/batch_*_mv_candidates.json"))
+        ]
+        artifacts["rewrite_meta"] = [
+            self.store.read_json(path)
+            for path in sorted(self.store.run_dir.glob("05_rewritten_sql/batch_*/*_rewrite/*_rewrite_meta.json"))
+        ]
+        artifacts["execution_orders"] = [
+            self.store.read_json(path)
+            for path in sorted(self.store.run_dir.glob("06_execution_logs/batch_*_execution_order.json"))
+        ]
+        return artifacts
 
     def _extract_run_id(self, run_log_text: str) -> str:
         for line in run_log_text.splitlines():
