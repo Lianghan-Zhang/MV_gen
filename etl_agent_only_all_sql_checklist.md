@@ -138,6 +138,8 @@
   - dimension-only family 不和 fact-based family 混合。
 - [ ] FamilyAgent 采用 generate + evaluate 两次 LLM 调用。
 - [ ] evaluate 检查重复 family、可合并 family、错误拆分、错误合并、成员 QueryBlock 归属错误。
+- [ ] `family_id` 按 `family_{family_type}_{domain}_{distinguishing_feature}` 语义命名，不能只按表集合命名。
+- [ ] `family_id` 必须全局唯一；完全重复 family 去重，同名但内容不同的 family 应在 evaluate 阶段生成语义可区分名称，代码层 `__2` 只作为 collision fallback 并写入日志。
 - [ ] 输出 `common_predicates`、`predicate_shapes`、`union_group_by_exprs`、`union_measure_exprs` 等供 BatchMVAgent 使用的字段。
 
 ### Phase 7: BatchClusterAgent
@@ -151,11 +153,14 @@
   - `join_filter_groupby`
   - `other`
 - [ ] batch 执行单位是完整 SQL / `query_id`。
-- [ ] 一个 SQL 的 batch 由可用 QueryBlock 的最高复杂度决定。
+- [ ] 一个 SQL 的顶层 batch 由代码层 canonical rules 根据可用 QueryBlock 的最高结构复杂度决定。
+- [ ] `join + group_by/aggregate` 即使没有 filter，也归入 `join_filter_groupby`。
+- [ ] `other` 只作为没有可用 QueryBlock 或无法归入前三类时的兜底 batch。
 - [ ] `family_groups` 只作为 batch 内组织信息。
 - [ ] 顶层 `query_ids` 必须去重；同一 SQL 可出现在多个 `family_groups`，但最终 rewrite / execution 只能发生一次。
 - [ ] `family_groups[].qb_ids` 只包含可用 QueryBlock，不包含带 `unsupported_reasons` 的 QueryBlock。
-- [ ] BatchClusterAgent 采用 generate + evaluate 两次 LLM 调用。
+- [ ] BatchClusterAgent 采用 generate + evaluate 两次 LLM 调用，但 LLM 顶层 batch 输出必须被代码层 canonicalize。
+- [ ] LLM 输出与 canonical batch 不一致时，run log 记录 `corrected_query_ids`。
 - [ ] 不做并发上限和子 batch 拆分。
 
 ### Phase 8: BatchWorkflowRunner
@@ -218,7 +223,7 @@
 
 - [ ] 固定 dry-run，不连接 Spark。
 - [ ] `materialize_mvs(...)` 将 `decision = materialize` 且依赖满足的 Candidate 写入 `materialized_mvs.json`。
-- [ ] 写入 `materialized_mvs.json` 时补齐 `source_candidate_id`、`source_batch_id`、`available_from_batch`、`family_id`、`source_qb_ids`、`target_qb_ids`、`depends_on_mv_ids`、`output_columns`、`column_mappings`、`build_sql_path`。
+- [ ] 写入 `materialized_mvs.json` 时补齐 `source_candidate_id`、`source_batch_id`、`available_from_batch`、`family_id`、`source_qb_ids`、`target_qb_ids`、`depends_on_mv_ids`、`mv_predicates`、`generalized_predicates`、`residual_filters`、`output_columns`、`column_mappings`、`build_sql_path`。
 - [ ] 失败或 skip Candidate 只写 run log。
 - [ ] `run_queries(...)` 读取 final rewrite SQL 和 meta。
 - [ ] 输出 `06_execution_logs/batch_{batch_id}_execution_order.json`。

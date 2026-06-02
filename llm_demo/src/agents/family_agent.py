@@ -6,6 +6,7 @@ from pathlib import Path
 from llm_demo.src.core.agent_base import LLMRulesAgent
 from llm_demo.src.core.artifact_store import ArtifactStore
 from llm_demo.src.core.family_candidate_builder import FamilyCandidateBuilder
+from llm_demo.src.core.family_utils import normalize_query_families
 from llm_demo.src.core.llm_client import LLMClient
 from llm_demo.src.core.schemas import FamilyOutput
 
@@ -41,6 +42,7 @@ class FamilyAgent(LLMRulesAgent):
             input_artifacts={**input_artifacts, "candidate_family_output": candidate_output},
             output_model=FamilyOutput,
         )
+        output["query_families"], family_normalization_events = normalize_query_families(output["query_families"])
         families_path = self.store.write_json("02_families/query_families.json", output)
         self.store.append_run_log(
             agent_name=self.agent_name,
@@ -48,6 +50,9 @@ class FamilyAgent(LLMRulesAgent):
             input_artifact_paths=[input_path] + ([Path(query_blocks_path)] if query_blocks_path else []),
             output_artifact_paths=[families_path],
             elapsed_ms=self._elapsed_ms(started_at),
-            details={"family_count": len(output["query_families"])},
+            details={
+                "family_count": len(output["query_families"]),
+                "family_normalization_events": family_normalization_events,
+            },
         )
         return families_path

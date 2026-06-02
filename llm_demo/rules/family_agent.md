@@ -8,7 +8,12 @@
 2. 输入的 `family_candidates` 是 code-only 预筛结果，只负责压缩候选空间；最终 family 仍由 FamilyAgent evaluate / merge / split 决定。
 3. 不允许把 `candidate_family_id` 原样当作最终结论；必须检查是否需要合并、拆分、删除重复或修正成员。
 4. `members` 只保存属于该 family 的 `qb_id`。
-5. `family_id` 必须稳定、可读，优先由核心表名生成，例如 `family_ss_dd_item`。
+5. `family_id` 必须稳定、可读且全局唯一。它不只按表集合命名，而是按“可共享 MV 的语义边界”命名，格式为 `family_{family_type}_{domain}_{distinguishing_feature}`。
+   - `family_type` 只能使用 `fact`、`dim`、`cte`、`mixed`。
+   - `domain` 使用核心 fact table，或核心 dimension / join domain。
+   - `distinguishing_feature` 使用能区分同表集合下不同 family 的关键 predicate、measure 或 derived semantics。
+   - 如果 evaluate 后出现完全重复的 family，应删除重复项；如果只是同名但成员、join 或 predicate 信息不同，应输出语义可区分的不同 `family_id`，不能让同一个 id 表示两个 family。
+   - 代码层的 `__2` 后缀只是避免流程中断的最后防线，不是设计命名规则；FamilyAgent 应优先生成语义唯一的 `family_id`。
 6. `QueryFamily` 不是简单 SQL 相似簇，而是一组可由同一个 upstream join-domain MV 或 shared superset MV 覆盖的 QueryBlock。
 7. 第一版优先保守合并；如果无法证明两个 QueryBlock 可被同一个 upstream MV 安全覆盖，保持分离。
 8. `common_tables` 记录 family 成员共同使用的物理表名。
@@ -33,6 +38,85 @@
 27. FamilyAgent 需要先生成候选 QueryFamily，再进行 evaluate。
 28. evaluate 阶段必须检查是否存在重复 family、可合并 family、错误拆分、错误合并、成员 QueryBlock 归属错误、`common_predicates` 与 `predicate_shapes` 混淆等问题。
 29. evaluate 阶段输出的仍然是完整 FamilyOutput，不输出单独评审报告。
+
+# family_id 命名规则
+
+1. fact-based family 使用：
+
+```text
+family_fact_{fact_table}_{main_dims}_{predicate_or_measure_feature}
+```
+
+例如 q42/q52 可写成：
+
+```text
+family_fact_store_sales_date_dim_item_manager_month_year
+```
+
+如果使用缩写，缩写必须稳定。第一版允许的常用缩写如下：
+
+```text
+store_sales -> ss
+catalog_sales -> cs
+web_sales -> ws
+store_returns -> sr
+catalog_returns -> cr
+web_returns -> wr
+inventory -> inv
+date_dim -> dd
+time_dim -> td
+customer_address -> ca
+item -> item
+customer -> customer
+```
+
+因此 q42/q52 也可写成：
+
+```text
+family_fact_ss_dd_item_manager_moy_year
+```
+
+2. dimension-only family 不能只写表名，必须加入关键过滤或派生语义。例如：
+
+```text
+family_dim_customer_address_city_mismatch
+family_dim_customer_dn_count_range
+```
+
+不要输出：
+
+```text
+family_customer_customer_address_dn
+```
+
+3. CTE / derived QueryBlock 应体现派生含义。例如 `customer_total_return` 可命名为：
+
+```text
+family_cte_store_returns_customer_total_return
+```
+
+如果 block 名是 `dn` 这类弱语义别名，不要直接把 `dn` 当核心语义，应根据来源逻辑命名，例如：
+
+```text
+family_dim_customer_dn_count_range
+```
+
+4. 同一表集合但 predicate shape 不同，必须进入命名区分。例如：
+
+```text
+family_fact_ss_dd_item_year_manager
+family_fact_ss_dd_item_category
+```
+
+5. 同一表集合但 measure 不同，也必须进入命名区分。例如：
+
+```text
+family_fact_ss_dd_item_sum_sales_price
+family_fact_ss_dd_item_sum_net_paid
+family_fact_ss_dd_item_count
+```
+
+6. q42/q52 这种 measure 相同但 group by 不同的 QueryBlock 仍应进入同一 family，因为可以通过更细粒度 MV roll-up 覆盖；不需要把 category / brand 分别写入两个 family_id。
 
 # 判定流程
 
@@ -145,7 +229,7 @@ roll-up: group by 维度可由更细粒度 aggregate MV 覆盖
 {
   "query_families": [
     {
-      "family_id": "family_ss_dd_item",
+      "family_id": "family_fact_ss_dd_item_manager_moy_year",
       "family_key": "store_sales-date_dim-item",
       "members": ["q42.outer", "q52.outer"],
       "common_tables": ["date_dim", "store_sales", "item"],
@@ -195,12 +279,12 @@ decision: keep separate
 {
   "query_families": [
     {
-      "family_id": "family_store_sales_dd_item",
+      "family_id": "family_fact_ss_dd_item_sum_sales_price",
       "members": ["q_store.outer"],
       "common_tables": ["store_sales", "date_dim", "item"]
     },
     {
-      "family_id": "family_web_sales_dd_item",
+      "family_id": "family_fact_ws_dd_item_sum_sales_price",
       "members": ["q_web.outer"],
       "common_tables": ["web_sales", "date_dim", "item"]
     }
@@ -251,7 +335,7 @@ decision: keep separate
 {
   "query_families": [
     {
-      "family_id": "family_ss_dd_item",
+      "family_id": "family_fact_ss_dd_item_manager_year",
       "family_key": "store_sales-date_dim-item",
       "members": ["q_year_2000.outer", "q_year_2001.outer"],
       "common_predicates": ["item.i_manager_id = 1"],
@@ -282,14 +366,14 @@ decision: keep separate
 {
   "query_families": [
     {
-      "family_id": "family_ss_dd_item_year",
+      "family_id": "family_fact_ss_dd_item_year",
       "family_key": "store_sales-date_dim-item",
       "members": ["q_year.outer"],
       "common_predicates": ["date_dim.d_year = 2000"],
       "predicate_shapes": ["date_dim.d_year = <CONST>"]
     },
     {
-      "family_id": "family_ss_dd_item_manager",
+      "family_id": "family_fact_ss_dd_item_manager"
       "family_key": "store_sales-date_dim-item",
       "members": ["q_manager.outer"],
       "common_predicates": ["item.i_manager_id = 1"],

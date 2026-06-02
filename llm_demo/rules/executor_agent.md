@@ -10,16 +10,17 @@ ExecutorAgent 第一版只做 dry-run，不连接 Spark，不真实执行 SQL。
 4. `decision = "materialize"` 且依赖满足的 MV Candidate 视为 dry-run 物化成功。
 5. `decision = "skip"` 的 MV Candidate 不写入 `materialized_mvs.json`。
 6. 如果 `depends_on_mv_ids` 中有任何 MV 不存在于当前 `materialized_mvs.json`，该 Candidate 物化失败，不写入 `materialized_mvs.json`。
-7. 单个 MV Candidate 失败不阻断当前 batch 的后续步骤。
-8. 每个 MV Candidate 都必须写 run log，事件为 `mv_materialize_success`、`mv_materialize_failed` 或 `mv_candidate_skipped`。
-9. `run_queries(...)` 按 `ComplexityBatch.query_ids` 顺序读取 final rewritten SQL，不重新排序。
-10. `run_queries(...)` 只输出运行顺序，不真实运行 SQL。
-11. 运行顺序统一写入 `06_execution_logs/batch_{batch_id}_execution_order.json`。
-12. execution order 中必须包含 `materialize_mv` 和 `run_query` 两类 step。
-13. `materialize_mv` step 记录 `candidate_id`、`mv_id`、`status`、`sql_path`、`depends_on_mv_ids` 和 `reason`。
-14. `run_query` step 记录 `query_id`、`status = "planned"`、`sql_path`、`meta_path` 和 `depends_on_mv_ids`。
-15. `run_query.depends_on_mv_ids` 必须直接来自对应 `{query_id}_rewrite_meta.json` 的 `used_mv_ids`。
-16. 如果 rewrite meta 缺少 `used_mv_ids`，不能推断依赖，必须直接失败。
+7. 成功写入 `materialized_mvs.json` 时，必须保留 MV Candidate 中的 `mv_predicates`、`generalized_predicates` 和 `residual_filters`，这些字段用于 RewriteAgent 判断查询过滤是否已被 MV predicate implied。
+8. 单个 MV Candidate 失败不阻断当前 batch 的后续步骤。
+9. 每个 MV Candidate 都必须写 run log，事件为 `mv_materialize_success`、`mv_materialize_failed` 或 `mv_candidate_skipped`。
+10. `run_queries(...)` 按 `ComplexityBatch.query_ids` 顺序读取 final rewritten SQL，不重新排序。
+11. `run_queries(...)` 只输出运行顺序，不真实运行 SQL。
+12. 运行顺序统一写入 `06_execution_logs/batch_{batch_id}_execution_order.json`。
+13. execution order 中必须包含 `materialize_mv` 和 `run_query` 两类 step。
+14. `materialize_mv` step 记录 `candidate_id`、`mv_id`、`status`、`sql_path`、`depends_on_mv_ids` 和 `reason`。
+15. `run_query` step 记录 `query_id`、`status = "planned"`、`sql_path`、`meta_path` 和 `depends_on_mv_ids`。
+16. `run_query.depends_on_mv_ids` 必须直接来自对应 `{query_id}_rewrite_meta.json` 的 `used_mv_ids`。
+17. 如果 rewrite meta 缺少 `used_mv_ids`，不能推断依赖，必须直接失败。
 
 # 示例
 

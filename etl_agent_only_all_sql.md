@@ -112,7 +112,7 @@ SQLLoaderAgent(code)
 83. 当前阶段不设计真实 Spark 执行边界，也不新增 `ExecutionAdapter`；`ExecutorAgent` 固定 dry-run，只把可物化 MV 视为已成功物化并输出 SQL 运行顺序。真实执行留到后续阶段重新设计。
 84. 每个 `run_id` 都视为一次孤立实验；系统不做跨 run 的 LLM 调用缓存、Feature 结果复用或 artifact 复用。第一版也不引入 prompt hash、rules hash、SQL hash 等缓存键，避免把实验复现和成本优化混在一起。
 85. Feature 提取允许 `partial_success`：如果一条 SQL 至少有一个可用 QueryBlock，即使其他 CTE / subquery / set branch 带有 `unsupported_reasons`，该 SQL 也可以进入后续 family、batch 和 final rewrite 流程；但 unsupported QueryBlock 不能作为 MV Candidate 来源或 rewrite 目标，只能保留为诊断证据并触发 skip / fallback。
-86. 当前可行性 demo 中，`BatchClusterAgent` 仍保持 `LLM + rules` 主导实现；即使 batch 映射规则较确定，也先不提前改成确定性算法。后续正式实现阶段可以在保持 artifact 契约不变的前提下替换为规则代码分类。
+86. 当前可行性 demo 中，`BatchClusterAgent` 保留 `LLM + rules` 外壳，但顶层 `query_id -> batch_id` 由代码层 canonical rules 按可用 QueryBlock 结构确定；LLM 只辅助生成候选、组织 `family_groups` 和暴露规则反馈证据。
 87. 当前可行性 demo 中，`FamilyAgent` 保持“代码预筛 + LLM 判定”的混合方案：`FamilyCandidateBuilder` 只负责 deterministic blocking / scoring 和证据生成，`FamilyAgent` 负责候选 family 的合并、拆分、evaluate 和 reason；不改成纯 LLM 聚类，也不改成纯代码分组。
 88. 当前可行性 demo 中，`BatchMVAgent` 保持 `LLM + rules` 主导实现，负责生成 MV Candidate、`build_sql`、`decision` 和 `reason`；代码层只做 schema 校验、SQLGlot 安全检查、物理列校验和依赖合法性检查，不提前拆成代码候选骨架。
 89. 当前可行性 demo 中，`RewriteAgent` 保持 `LLM + rules` 主导实现，负责生成 rewritten SQL 和 rewrite meta；代码层只做 SQLGlot 解析、可用 MV 校验、MV 物理列引用检查、输出列名 / `ORDER BY` / `LIMIT` 契约校验和 fallback 触发，不提前改成模板化或 AST rewrite。
@@ -677,7 +677,7 @@ run_log
 
 1. 业务结果以 artifact 为唯一事实来源。
 2. Notebook 中可以用普通变量保存路径，但不形成新的系统级数据结构；这些路径应来自 `ArtifactStore` 命名方法。
-3. `materialized_mvs.json` 是 Materialized View State，只保存已经成功物化且可被 RewriteAgent 使用的 Materialized View。
+3. `materialized_mvs.json` 是 Materialized View State，只保存已经成功物化且可被 RewriteAgent 使用的 Materialized View；它必须保留 `mv_predicates`、`generalized_predicates` 和 `residual_filters`，否则 RewriteAgent 无法判断查询 filter 是否已经被 MV predicate 覆盖。
 4. `run_log.jsonl` 记录每个 Agent 的输入路径、输出路径、耗时、错误，不参与业务决策；每条记录必须有稳定的 `event_id`。
 5. MV Candidate 中被跳过、物化失败或仅用于诊断的信息保留在 `batch_{batch_id}_mv_candidates.json` 和 `run_log.jsonl`，不写入 `materialized_mvs.json`。
 6. `run_id` 由 notebook 在每次实验开始时生成，建议使用 `YYYYMMDD_HHMMSS` 或手动命名的实验 ID。
@@ -720,15 +720,37 @@ feedback_rules_path()
     {
       "mv_id": "mv_ss_dd_item_mgr1_y2000_m11_fg",
       "table_name": "mv_ss_dd_item_mgr1_y2000_m11_fg",
-      "source_candidate_id": "cand_batch_2_family_ss_dd_item_0001",
+      "source_candidate_id": "cand_batch_2_family_fact_ss_dd_item_manager_moy_year_0001",
       "source_batch_id": 2,
       "available_from_batch": 2,
-      "family_id": "family_ss_dd_item",
+      "family_id": "family_fact_ss_dd_item_manager_moy_year",
       "family_type": "fact_based",
       "target_queries": ["q42", "q52"],
       "source_qb_ids": ["q42.outer", "q52.outer"],
       "target_qb_ids": ["q42.outer", "q52.outer"],
       "depends_on_mv_ids": ["mv_batch_1_example"],
+      "mv_predicates": [
+        "item.i_manager_id = 1",
+        "date_dim.d_moy = 11",
+        "date_dim.d_year IN (2000)"
+      ],
+      "generalized_predicates": [
+        {
+          "predicate_shape": "date_dim.d_year = <CONST>",
+          "covered_values": [2000],
+          "source_query_ids": ["q42", "q52"]
+        }
+      ],
+      "residual_filters": [
+        {
+          "query_id": "q42",
+          "predicates": []
+        },
+        {
+          "query_id": "q52",
+          "predicates": []
+        }
+      ],
       "group_by_exprs": ["date_dim.d_year", "date_dim.d_moy", "item.i_manager_id"],
       "measure_exprs": ["SUM(store_sales.ss_ext_sales_price) AS sum_ss_ext_sales_price"],
       "output_columns": [
@@ -773,7 +795,7 @@ feedback_rules_path()
 }
 ```
 
-该文件不保存 `status = failed`、`decision = skip` 或未执行的 MV Candidate。成功物化的 MV 可以保留 `source_candidate_id`、`source_qb_ids` 和 `target_qb_ids`，用于回溯其来源候选和支持 QueryBlock-local rewrite。RewriteAgent 读取这个文件判断可用 Materialized View，并使用其中的 `output_columns` / `column_mappings.mv_column` 作为可引用的 MV 物理列集合。
+该文件不保存 `status = failed`、`decision = skip` 或未执行的 MV Candidate。成功物化的 MV 可以保留 `source_candidate_id`、`source_qb_ids` 和 `target_qb_ids`，用于回溯其来源候选和支持 QueryBlock-local rewrite。RewriteAgent 读取这个文件判断可用 Materialized View，并使用其中的 `mv_predicates` / `generalized_predicates` 判断 MV 已包含的过滤语义，使用 `residual_filters` 判断下游仍需补充的过滤条件，使用 `output_columns` / `column_mappings.mv_column` 作为可引用的 MV 物理列集合。
 
 `run_log.jsonl` 的单行最小结构：
 
@@ -783,7 +805,7 @@ feedback_rules_path()
   "event_id": "20260524_153000:ExecutorAgent:batch_2:0001",
   "agent_name": "ExecutorAgent",
   "batch_id": 2,
-  "candidate_id": "cand_batch_2_family_ss_dd_item_0001",
+  "candidate_id": "cand_batch_2_family_fact_ss_dd_item_manager_moy_year_0001",
   "input_artifact_paths": ["..."],
   "output_artifact_paths": ["..."],
   "elapsed_ms": 1200,
@@ -958,8 +980,16 @@ Batch-4 = other
 
 `BatchClusterAgent` 的判定过程分两层：
 
-1. 在每个 QueryFamily 内，根据成员 QueryBlock 的复杂度为所属 SQL 标注候选 batch。
-2. 把不同 family 中同一复杂度层级的 SQL 合并到全局 batch 中。
+1. LLM 先根据 QueryBlock、`query_to_qbs` 和 QueryFamily 生成候选 ComplexityBatch 与 `family_groups`。
+2. 代码层再按 canonical rules 重建顶层 `query_id -> batch_id` 和 batch 内 `family_groups`，确保全量 SQL 下结果稳定可复现。
+
+Canonical rules：
+
+1. 跳过带 `unsupported_reasons` 的 QueryBlock。
+2. 对可用 QueryBlock 重新判断结构复杂度：`join + group_by/aggregate -> join_filter_groupby`，`join + filter -> join_filter`，纯 join -> `join`。
+3. `join_filter_groupby` 表示 join 上的聚合复杂层，不要求 filter 必须存在。
+4. `other` 是兜底 batch；只有没有可用 QueryBlock 或可用 QueryBlock 无法归入前三类时才进入 `other`。
+5. 如果 LLM 输出与 canonical rules 不一致，实现层按 canonical rules 修正，并在 run log 的 `corrected_query_ids` 中记录差异。
 
 因此，最终执行顺序仍是全局 `Batch-1 -> Batch-2 -> Batch-3 -> Batch-4`，不是按 family 分别执行。`ComplexityBatch` 内部用 `family_groups` 保存 batch 内的 family 组织关系，供 `BatchMVAgent` 生成 MV Candidate 使用。对 `partial_success` SQL，batch 只根据可用 QueryBlock 判断；带 `unsupported_reasons` 的 QueryBlock 不参与 family_groups 和 MV candidate 生成，但完整 SQL 仍可以在 final rewrite 阶段以 fallback 方式输出。
 
@@ -972,7 +1002,7 @@ Batch-4 = other
 | `artifacts/{run_id}/01_query_blocks/query_to_qbs.json` | SQL 到 QB 索引 |
 | `artifacts/{run_id}/01_query_blocks/qb_to_query.json` | QB 到 SQL 索引 |
 | `artifacts/{run_id}/02_families/query_families.json` | LLM 生成的 QueryFamily |
-| `artifacts/{run_id}/03_batches/complexity_batches.json` | LLM 生成的 SQL 级 batch |
+| `artifacts/{run_id}/03_batches/complexity_batches.json` | LLM 候选经代码 canonicalize 后生成的 SQL 级 batch |
 
 ### 6.2 Batch 编排
 
@@ -1239,23 +1269,31 @@ GROUP BY
 27. `FamilyAgent` 采用两次 LLM 调用：第一次基于 candidate family groups 生成 `candidate_query_families`，第二次 evaluate 并修正输出。
 28. evaluate 阶段输入为 QueryBlock 列表、family candidate groups 和 `candidate_query_families`，输出仍是修正后的完整 QueryFamily。
 29. evaluate 阶段重点检查是否存在重复 family、可合并 family、family_key 与 join skeleton 不一致、成员 QueryBlock 归属错误、common 字段错误等问题。
-30. family candidate 第一层使用表集合量化：`Jaccard(A,B)=|T(A)∩T(B)|/|T(A)∪T(B)|` 衡量相似度，`Containment(A,B)=|T(A)∩T(B)|/min(|T(A)|,|T(B)|)` 识别宽表覆盖关系。
-31. core fact table 是 QueryBlock join domain 中承载事实记录或主要 measure 来源的中心表；TPC-DS 第一版可优先识别 `store_sales`、`catalog_sales`、`web_sales`、`store_returns`、`catalog_returns`、`web_returns`、`inventory`。
-32. candidate 分层规则：`strong candidate` = `Jaccard = 1.0`，或 `Containment = 1.0` 且 core fact table 相同；`medium candidate` = `Jaccard >= 0.6` 且 core fact table 相同，或 `Containment >= 0.8` 且较小 QueryBlock 的表集合主要被较大 join domain 覆盖；低于该阈值默认保持分离。
-33. core fact table 相同是 family 合并 hard gate；如果 core fact table 不同，即使 Jaccard / Containment 较高，也默认保持分离。
-34. 多 fact table QueryBlock 只允许与具有完全相同 `core_fact_table_set`、且 join graph 可证明不会引入行数膨胀的 QueryBlock 合并；否则单独成 family。
-35. 单 fact QueryBlock 和多 fact QueryBlock 不混合进同一个 family；例如 `{store_sales}` 不能和 `{store_sales, store_returns}` 合并。
-36. dimension-only QueryBlock 不混入 fact-based family；如果后续 fact query 使用该维表 MV，应通过 RewriteAgent 的局部 rewrite 或后续 MV 依赖表达，而不是 family 合并表达。
-37. Jaccard 和 Containment 只负责生成 candidate，不直接决定最终合并。
-38. family 最终合并采用安全门：core fact table、join graph、predicate shape、measure compatibility 和 roll-up safety 必须可证明兼容。
-39. family 合并采用 predicate 兼容标准，而不是要求 predicate 完全相同。
-40. 第一版 predicate shape 兼容只允许两类情况：同一过滤列常量不同，例如 `date_dim.d_year = 2000` 与 `date_dim.d_year = 2001`；或者一方比另一方多出过滤条件，且多出的过滤列可在 MV 中保留并作为下游 residual filter。
-41. 如果两个 QueryBlock 的过滤列集合完全不同，例如一个只过滤 `date_dim.d_year`，另一个只过滤 `item.i_manager_id`，即使 core fact table、join graph 和 measure 兼容，也必须拆成不同 family。
-42. 如果两个 family 的 QueryBlock 具有相同或可证明等价的 join skeleton、同构过滤列结构但常量值不同、兼容 measure，并且后续可共享 MV，应在 evaluate 阶段合并为同一个 family。
-43. `common_predicates` 只记录 family 内完全相同的完整谓词，例如所有成员都有 `item.i_manager_id = 1`。
-44. `predicate_shapes` 记录同构过滤列但常量值可能不同的谓词形状，例如 `date_dim.d_year = <CONST>`、`date_dim.d_moy = <CONST>`。
-45. `predicate_shapes` 中的字段名必须使用物理表名，不使用 SQL alias。
-46. 如果过滤列集合差异过大、predicate 语义不清或 family 是否可合并无法证明，保持分离，并在后续 SelfIterationAgent 的反馈中记录规则改进建议，而不是在 BatchMVAgent 中跨 family 生成 MV。
+30. `family_id` 是 BatchClusterAgent 与 BatchMVAgent 维护单 family 边界的键，必须全局唯一；它不只按表集合命名，而应按“可共享 MV 的语义边界”命名。
+31. `family_id` 第一版采用三层格式：`family_{family_type}_{domain}_{distinguishing_feature}`。`family_type` 使用 `fact`、`dim`、`cte`、`mixed`；`domain` 使用核心 fact table 或核心 dimension / join domain；`distinguishing_feature` 使用关键 predicate、measure 或 derived semantics。
+32. fact-based family 优先使用 `family_fact_{fact_table}_{main_dims}_{predicate_or_measure_feature}`，例如 q42/q52 可命名为 `family_fact_store_sales_date_dim_item_manager_month_year`，或使用稳定缩写 `family_fact_ss_dd_item_manager_moy_year`。
+33. dimension-only family 不能只写表名，必须包含关键过滤或派生语义。例如 `q46.outer` 可命名为 `family_dim_customer_address_city_mismatch`，`q34.outer` 可命名为 `family_dim_customer_dn_count_range`；不应使用 `family_customer_customer_address_dn` 这类弱区分命名。
+34. CTE / derived QueryBlock 应体现派生含义，例如 `customer_total_return` 可命名为 `family_cte_store_returns_customer_total_return`；如果 block 名是 `dn` 这类弱语义别名，应根据来源逻辑命名，而不是直接把 `dn` 当作核心语义。
+35. 同一表集合但 predicate shape 不同，必须进入命名区分，例如 `family_fact_ss_dd_item_year_manager` 与 `family_fact_ss_dd_item_category`；同一表集合但 measure 不同也必须进入命名区分，例如 `family_fact_ss_dd_item_sum_sales_price`、`family_fact_ss_dd_item_sum_net_paid`、`family_fact_ss_dd_item_count`。
+36. q42/q52 这种 measure 相同但 group by 不同的 QueryBlock 仍应进入同一 family，因为可以用更细粒度 MV roll-up 覆盖；不需要把 category / brand 拆成两个 family。
+37. 完全重复的 family 应去重；同名但内容不同的 family 必须在 FamilyAgent evaluate 阶段生成语义可区分的不同 `family_id`。代码层追加 `__2` 只是避免流程中断的最后防线，不是设计命名规则，并且必须写入 run log 供 SelfIterationAgent 反馈。
+38. family candidate 第一层使用表集合量化：`Jaccard(A,B)=|T(A)∩T(B)|/|T(A)∪T(B)|` 衡量相似度，`Containment(A,B)=|T(A)∩T(B)|/min(|T(A)|,|T(B)|)` 识别宽表覆盖关系。
+39. core fact table 是 QueryBlock join domain 中承载事实记录或主要 measure 来源的中心表；TPC-DS 第一版可优先识别 `store_sales`、`catalog_sales`、`web_sales`、`store_returns`、`catalog_returns`、`web_returns`、`inventory`。
+40. candidate 分层规则：`strong candidate` = `Jaccard = 1.0`，或 `Containment = 1.0` 且 core fact table 相同；`medium candidate` = `Jaccard >= 0.6` 且 core fact table 相同，或 `Containment >= 0.8` 且较小 QueryBlock 的表集合主要被较大 join domain 覆盖；低于该阈值默认保持分离。
+41. core fact table 相同是 family 合并 hard gate；如果 core fact table 不同，即使 Jaccard / Containment 较高，也默认保持分离。
+42. 多 fact table QueryBlock 只允许与具有完全相同 `core_fact_table_set`、且 join graph 可证明不会引入行数膨胀的 QueryBlock 合并；否则单独成 family。
+43. 单 fact QueryBlock 和多 fact QueryBlock 不混合进同一个 family；例如 `{store_sales}` 不能和 `{store_sales, store_returns}` 合并。
+44. dimension-only QueryBlock 不混入 fact-based family；如果后续 fact query 使用该维表 MV，应通过 RewriteAgent 的局部 rewrite 或后续 MV 依赖表达，而不是 family 合并表达。
+45. Jaccard 和 Containment 只负责生成 candidate，不直接决定最终合并。
+46. family 最终合并采用安全门：core fact table、join graph、predicate shape、measure compatibility 和 roll-up safety 必须可证明兼容。
+47. family 合并采用 predicate 兼容标准，而不是要求 predicate 完全相同。
+48. 第一版 predicate shape 兼容只允许两类情况：同一过滤列常量不同，例如 `date_dim.d_year = 2000` 与 `date_dim.d_year = 2001`；或者一方比另一方多出过滤条件，且多出的过滤列可在 MV 中保留并作为下游 residual filter。
+49. 如果两个 QueryBlock 的过滤列集合完全不同，例如一个只过滤 `date_dim.d_year`，另一个只过滤 `item.i_manager_id`，即使 core fact table、join graph 和 measure 兼容，也必须拆成不同 family。
+50. 如果两个 family 的 QueryBlock 具有相同或可证明等价的 join skeleton、同构过滤列结构但常量值不同、兼容 measure，并且后续可共享 MV，应在 evaluate 阶段合并为同一个 family。
+51. `common_predicates` 只记录 family 内完全相同的完整谓词，例如所有成员都有 `item.i_manager_id = 1`。
+52. `predicate_shapes` 记录同构过滤列但常量值可能不同的谓词形状，例如 `date_dim.d_year = <CONST>`、`date_dim.d_moy = <CONST>`。
+53. `predicate_shapes` 中的字段名必须使用物理表名，不使用 SQL alias。
+54. 如果过滤列集合差异过大、predicate 语义不清或 family 是否可合并无法证明，保持分离，并在后续 SelfIterationAgent 的反馈中记录规则改进建议，而不是在 BatchMVAgent 中跨 family 生成 MV。
 
 以 q42 / q52 为例，二者的表集合均为 `{date_dim, store_sales, item}`，`Jaccard = 1.0`，`Containment = 1.0`，core fact table 均为 `store_sales`，join graph、predicate shape 和 measure 均兼容，因此可以归入同一 `QueryFamily`。如果另一个 QueryBlock 使用 `web_sales` 作为事实表，即使也连接 `date_dim` 和 `item`，第一版也不与 `store_sales` family 合并。
 
@@ -1265,7 +1303,7 @@ GROUP BY
 {
   "query_families": [
     {
-      "family_id": "family_ss_dd_item",
+      "family_id": "family_fact_ss_dd_item_manager_moy_year",
       "family_key": "store_sales-date_dim-item",
       "family_type": "fact_based",
       "core_fact_table_set": ["store_sales"],
@@ -1305,19 +1343,20 @@ GROUP BY
 规则重点：
 
 1. batch 分配单位是 SQL/query_id，不是 qb_id。
-2. 一个 SQL 的复杂度取其可用 QueryBlock 的最高复杂度。
+2. 顶层 `query_id -> batch_id` 由代码层 canonical rules 决定，LLM 输出只作为候选和 `family_groups` 组织参考。
 3. batch 映射固定为 `join -> Batch-1`、`join_filter -> Batch-2`、`join_filter_groupby -> Batch-3`、`other -> Batch-4`。
-4. 当前不处理并发上限、子 batch 拆分。
-5. 先在每个 QueryFamily 内进行复杂度分层，再把同一复杂度层级的 SQL 合并到对应的 global batch。
-6. 不输出独立的 `FamilyBatch` artifact；family 内部分层结果只体现在 `ComplexityBatch.family_groups` 中。
-7. 顶层 `query_ids` 表示该 global batch 要处理的完整 SQL，必须去重。
-8. 如果一个 SQL 的多个 QueryBlock 属于不同 family，该 `query_id` 可以出现在多个 `family_groups` 中；这是 MV 生成视角的重复，不代表该 SQL 会被执行多次。
-9. 每个 `family_groups[].qb_ids` 只能包含该 family 的 QueryBlock；`family_groups[].query_ids` 必须由这些 QB 对应的 query_id 去重得到。
-10. `family_groups[].qb_ids` 默认只包含可用 QueryBlock，不包含带 `unsupported_reasons` 的 QueryBlock。
-11. `partial_success` SQL 可以进入 global batch；其 batch 由可用 QueryBlock 的最高复杂度决定。如果只剩 unsupported QueryBlock，没有任何可用 QueryBlock，则不进入 batch。
-12. 如果 unsupported outer QueryBlock 导致完整 SQL 语义边界不清，但某个 CTE / subquery QueryBlock 可用，该 SQL 可以被放入可用 block 对应的 batch；final rewrite 必须由 RewriteAgent 保守 fallback 或只做可证明安全的 QueryBlock-local rewrite。
-13. `BatchClusterAgent` 采用两次 LLM 调用：第一次生成 `candidate_complexity_batches`，第二次 evaluate 并修正输出。
-14. evaluate 阶段输入为 QueryBlock、`query_to_qbs`、QueryFamily 和 `candidate_complexity_batches`，输出仍是修正后的完整 ComplexityBatch。
+4. `join_filter_groupby` 表示 join 上的聚合复杂层；`join + group_by/aggregate` 即使没有 filter，也进入 Batch-3。
+5. `other` 是兜底 batch；没有可用 QueryBlock 或无法归入前三类时进入 Batch-4。
+6. 当前不处理并发上限、子 batch 拆分。
+7. 先在每个 QueryFamily 内收集可用成员 QueryBlock，再按所属 SQL 的 canonical batch 组织到对应 global batch 的 `family_groups`。
+8. 不输出独立的 `FamilyBatch` artifact；family 内部分层结果只体现在 `ComplexityBatch.family_groups` 中。
+9. 顶层 `query_ids` 表示该 global batch 要处理的完整 SQL，必须去重。
+10. 如果一个 SQL 的多个 QueryBlock 属于不同 family，该 `query_id` 可以出现在多个 `family_groups` 中；这是 MV 生成视角的重复，不代表该 SQL 会被执行多次。
+11. 每个 `family_groups[].qb_ids` 只能包含该 family 的可用 QueryBlock；`family_groups[].query_ids` 必须由这些 QB 对应的 query_id 去重得到。
+12. `family_groups[].qb_ids` 默认只包含可用 QueryBlock，不包含带 `unsupported_reasons` 的 QueryBlock。
+13. 如果 unsupported outer QueryBlock 导致完整 SQL 语义边界不清，但某个 CTE / subquery QueryBlock 可用，该 SQL 可以被放入可用 block 对应的 batch；final rewrite 必须由 RewriteAgent 保守 fallback 或只做可证明安全的 QueryBlock-local rewrite。
+14. `BatchClusterAgent` 采用两次 LLM 调用：第一次生成 `candidate_complexity_batches`，第二次 evaluate；最终输出会被代码层 canonicalize。
+15. evaluate 阶段输入为 QueryBlock、`query_to_qbs`、QueryFamily 和 `candidate_complexity_batches`，输出仍是修正后的完整 ComplexityBatch；如 LLM 与 canonical rules 不一致，实现层在 run log 记录 `corrected_query_ids`。
 15. evaluate 阶段重点检查：每个 SQL 是否按最高可用 QueryBlock 复杂度进入唯一 global batch、顶层 `query_ids` 是否去重、`family_groups` 是否只作为 batch 内组织信息、是否遗漏或误分 QueryBlock。
 
 输出 JSON：
@@ -1337,7 +1376,7 @@ GROUP BY
       "query_ids": ["q42", "q52"],
       "family_groups": [
         {
-          "family_id": "family_ss_dd_item",
+          "family_id": "family_fact_ss_dd_item_manager_moy_year",
           "query_ids": ["q42", "q52"],
           "qb_ids": ["q42.outer", "q52.outer"]
         }
@@ -1429,12 +1468,12 @@ GROUP BY
   "batch_id": 2,
   "mv_candidates": [
     {
-      "candidate_id": "cand_batch_2_family_ss_dd_item_0001",
+      "candidate_id": "cand_batch_2_family_fact_ss_dd_item_manager_moy_year_0001",
       "mv_id": "mv_ss_dd_item_mgr1_y2000_m11_fg",
       "source_batch_id": 2,
       "source_query_ids": ["q42", "q52"],
       "source_qb_ids": ["q42.outer", "q52.outer"],
-      "family_id": "family_ss_dd_item",
+      "family_id": "family_fact_ss_dd_item_manager_moy_year",
       "family_type": "fact_based",
       "mv_type": "fine_grain_aggregate",
       "target_table_name": "mv_ss_dd_item_mgr1_y2000_m11_fg",
@@ -1568,17 +1607,19 @@ GROUP BY
 18. 对复杂 window、rollup、count distinct、stddev、相关子查询默认 fallback。
 19. 对 `partial_success` SQL，RewriteAgent 可以改写可证明安全的 QueryBlock；遇到带 `unsupported_reasons` 的 QueryBlock，必须保持 original-equivalent 或 fallback，不能强行使用 MV。
 20. QueryBlock-local rewrite 的 `target_qb_ids` 不能包含带 `unsupported_reasons` 的 QueryBlock。
-21. 使用 MV rewrite 时，只能引用 `materialized_mvs.json` 中的 `output_columns` 或 `column_mappings.mv_column`。
-22. rewritten SQL 不能从 MV 表中引用 `date_dim.d_year`、`` `date_dim.d_year` ``、`item.i_brand_id` 这类源表限定列名；源字段身份只用于规则判断和日志解释。
-23. rewritten SQL 必须保留 original SQL 的输出列名。显式或隐式 alias 必须保留，例如 q52 中的 `brand_id`、`brand`、`ext_price`。
-24. original SQL 中没有 alias 的表达式也必须保留 Spark 输出名。例如 q42 的 `sum(ss_ext_sales_price)` 没有 alias，rewrite 时应输出 `AS \`sum(ss_ext_sales_price)\``，不能改成 `AS sum_ss_ext_sales_price`。
-25. final rewrite 必须保留 original SQL 的 `ORDER BY` 和 `LIMIT`；如果 original SQL 有排序或 limit，rewritten SQL 也必须保留对应排序项数量、排序方向和 limit 值。
-26. 如果 final rewrite 没有保留 `ORDER BY` / `LIMIT`，RewriteAgent 最多重试 2 次；仍无法修正时 fallback 到 original-equivalent SQL。
-27. 如果无法证明输出列名、排序或 limit 一致，必须 fallback 到 original-equivalent SQL。
-28. RewriteAgent 可以输出 `rewrite_mode = "query_block_local_rewrite"`，用于只改写 CTE / subquery body；此时 `target_qb_ids` 必须非空。
-29. QueryBlock-local rewrite 不改变外层 Query 的 SELECT、JOIN、WHERE、GROUP BY、ORDER BY、LIMIT 等结构，只替换目标 QueryBlock 的内部 SQL。
-30. CTE / subquery body 被 MV 改写后，必须继续提供父 Query 所引用的列名或 alias；如果 MV 物理列名不同，rewritten block 必须显式 `AS original_block_column_name`。
-31. 如果不能证明 rewritten block 保持原 QueryBlock 输出契约，或不能证明父 Query 的依赖关系不变，必须 fallback。
+21. 判断 filter 覆盖关系时，必须读取 `materialized_mvs.json` 中的 `mv_predicates`、`generalized_predicates` 和 `residual_filters`。
+22. 如果 query filter 已经被 `mv_predicates` 或 `generalized_predicates` 覆盖，不要求该过滤列出现在 MV 的 `output_columns` 中；只有仍需在 rewritten SQL 中执行的 residual filter，才要求对应列存在于 `output_columns` 或 `column_mappings.mv_column`。
+23. 使用 MV rewrite 时，只能引用 `materialized_mvs.json` 中的 `output_columns` 或 `column_mappings.mv_column`。
+24. rewritten SQL 不能从 MV 表中引用 `date_dim.d_year`、`` `date_dim.d_year` ``、`item.i_brand_id` 这类源表限定列名；源字段身份只用于规则判断和日志解释。
+25. rewritten SQL 必须保留 original SQL 的输出列名。显式或隐式 alias 必须保留，例如 q52 中的 `brand_id`、`brand`、`ext_price`。
+26. original SQL 中没有 alias 的表达式也必须保留 Spark 输出名。例如 q42 的 `sum(ss_ext_sales_price)` 没有 alias，rewrite 时应输出 `AS \`sum(ss_ext_sales_price)\``，不能改成 `AS sum_ss_ext_sales_price`。
+27. final rewrite 必须保留 original SQL 的 `ORDER BY` 和 `LIMIT`；如果 original SQL 有排序或 limit，rewritten SQL 也必须保留对应排序项数量、排序方向和 limit 值。
+28. 如果 final rewrite 没有保留 `ORDER BY` / `LIMIT`，RewriteAgent 最多重试 2 次；仍无法修正时 fallback 到 original-equivalent SQL。
+29. 如果无法证明输出列名、排序或 limit 一致，必须 fallback 到 original-equivalent SQL。
+30. RewriteAgent 可以输出 `rewrite_mode = "query_block_local_rewrite"`，用于只改写 CTE / subquery body；此时 `target_qb_ids` 必须非空。
+31. QueryBlock-local rewrite 不改变外层 Query 的 SELECT、JOIN、WHERE、GROUP BY、ORDER BY、LIMIT 等结构，只替换目标 QueryBlock 的内部 SQL。
+32. CTE / subquery body 被 MV 改写后，必须继续提供父 Query 所引用的列名或 alias；如果 MV 物理列名不同，rewritten block 必须显式 `AS original_block_column_name`。
+33. 如果不能证明 rewritten block 保持原 QueryBlock 输出契约，或不能证明父 Query 的依赖关系不变，必须 fallback。
 
 输出 JSON：
 
@@ -1671,7 +1712,7 @@ GROUP BY
               "artifact": "{run_id}/06_execution_logs/run_log.jsonl",
               "event_id": "20260526_153000:BatchMVAgent:batch_2:0007",
               "batch_id": 2,
-              "candidate_id": "cand_batch_2_family_ss_dd_item_0001",
+              "candidate_id": "cand_batch_2_family_fact_ss_dd_item_manager_moy_year_0001",
               "mv_id": "mv_ss_dd_item_mgr1_y2000_m11_fg",
               "query_ids": ["q42", "q52"],
               "event": "mv_benefit_lower_than_expected"

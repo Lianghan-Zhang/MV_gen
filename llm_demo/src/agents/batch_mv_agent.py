@@ -7,6 +7,7 @@ from typing import Any
 
 from llm_demo.src.core.agent_base import LLMRulesAgent
 from llm_demo.src.core.artifact_store import ArtifactStore
+from llm_demo.src.core.family_utils import normalize_query_families
 from llm_demo.src.core.llm_client import LLMClient
 from llm_demo.src.core.physical_schema import load_physical_schema, validate_physical_column
 from llm_demo.src.core.schemas import BatchMVOutput
@@ -46,6 +47,7 @@ class BatchMVAgent(LLMRulesAgent):
         query_to_qbs = self.store.read_json(qb_path.parent / "query_to_qbs.json")
         qb_to_query = self.store.read_json(qb_path.parent / "qb_to_query.json")
         families = self.store.read_json(family_path)
+        families["query_families"], family_normalization_events = normalize_query_families(families.get("query_families", []))
         materialized_mvs = self.store.read_json(mv_state_path)
         historical_rewrites = self._load_historical_rewrites(rewrite_dir)
 
@@ -101,6 +103,7 @@ class BatchMVAgent(LLMRulesAgent):
                 "llm_stages": ["generate_candidate_mv_output", "evaluate_mv_output"],
                 "candidate_count": len(candidate_ids),
                 "candidate_ids": candidate_ids,
+                "family_normalization_events": family_normalization_events,
             },
         )
         self._append_candidate_logs(output, mv_candidates_path, mv_build_path, batch_id)
