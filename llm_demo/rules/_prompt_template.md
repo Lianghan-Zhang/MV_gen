@@ -22,8 +22,8 @@
 8. 各阶段的标识符必须保持稳定。
 9. MV candidate 只能在当前 batch 内生成。
 10. 已物化成功的 MV 对后续 batch 全局可用。
-11. 可以只读参考完整的 `complexity_batches.json` 和 `query_families.json` 来判断当前 batch MV 的后续复用价值，但不能为未来 batch 生成 MV Candidate。
-12. MV Candidate 必须有当前 batch 的 Query 或 QueryFamily 依据；下游信息只能影响 `decision` 和 `reason`，不能单独触发候选生成。
+11. 可以只读参考完整的 `complexity_batches.json`、QueryFamily hint 和已物化 MV 状态来判断当前 batch MV 的后续复用价值，但不能为未来 batch 生成 MV Candidate。
+12. MV Candidate 必须有当前 batch 的 QueryBlock 依据；下游信息只能影响 `decision` 和 `reason`，不能单独触发候选生成。
 
 # 当前上下文
 

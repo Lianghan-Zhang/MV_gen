@@ -5,7 +5,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-ComplexityType = Literal["join", "join_filter", "join_filter_groupby", "other"]
+BatchType = Literal[
+    "Batch-1",
+    "Batch-2",
+    "Batch-3",
+    "Batch-4",
+    "Batch-5",
+    "Other",
+]
 MVType = Literal["fine_grain_aggregate", "detail_superset", "dimension_only"]
 MVDecision = Literal["materialize", "skip"]
 RewriteStage = Literal["historical", "final"]
@@ -13,6 +20,45 @@ RewriteStatus = Literal["rewritten", "fallback"]
 ExecutionStepType = Literal["materialize_mv", "run_query"]
 ExecutionStatus = Literal["success", "failed", "skipped", "planned"]
 FeatureStatus = Literal["success", "partial_success", "feature_failed", "unsupported_sql_pattern"]
+
+
+class RelationInstance(BaseModel):
+    relation_instance_id: str
+    physical_table: str
+    role: str | None = None
+
+
+class JoinEdge(BaseModel):
+    left_relation_instance_id: str
+    left_table: str
+    left_column: str
+    right_relation_instance_id: str
+    right_table: str
+    right_column: str
+    operator: str = "="
+    expr: str
+
+
+class QueryExpression(BaseModel):
+    expr: str
+    columns: list[str] = Field(default_factory=list)
+    relation_instance_ids: list[str] = Field(default_factory=list)
+
+
+class PredicateExpression(QueryExpression):
+    predicate_shape: str | None = None
+
+
+class AggregateExpression(BaseModel):
+    expr: str
+    agg_func: str
+    source_table: str | None = None
+    source_column: str | None = None
+    source_relation_instance_id: str | None = None
+
+
+class OrderByExpression(QueryExpression):
+    direction: str | None = None
 
 
 class QueryBlock(BaseModel):
@@ -23,13 +69,15 @@ class QueryBlock(BaseModel):
     parent_qb_id: str | None = None
     depends_on_qb_ids: list[str] = Field(default_factory=list)
     structural_flags: list[str] = Field(default_factory=list)
+    relation_instances: list[RelationInstance] = Field(default_factory=list)
     tables: list[str] = Field(default_factory=list)
-    join_edges: list[Any] = Field(default_factory=list)
-    predicates: list[str] = Field(default_factory=list)
-    group_by_exprs: list[str] = Field(default_factory=list)
-    aggregate_exprs: list[str] = Field(default_factory=list)
-    complexity_type: ComplexityType
-    family_key: str
+    join_edges: list[JoinEdge] = Field(default_factory=list)
+    predicates: list[PredicateExpression] = Field(default_factory=list)
+    projections: list[QueryExpression] = Field(default_factory=list)
+    group_by_exprs: list[QueryExpression] = Field(default_factory=list)
+    aggregate_exprs: list[AggregateExpression] = Field(default_factory=list)
+    order_by_exprs: list[OrderByExpression] = Field(default_factory=list)
+    limit: str | int | None = None
     unsupported_reasons: list[str] = Field(default_factory=list)
 
 
@@ -119,7 +167,7 @@ class FamilyGroup(BaseModel):
 
 class ComplexityBatch(BaseModel):
     batch_id: int
-    batch_type: ComplexityType
+    batch_type: BatchType
     query_ids: list[str] = Field(default_factory=list)
     family_groups: list[FamilyGroup] = Field(default_factory=list)
 
@@ -152,7 +200,8 @@ class MVCandidate(BaseModel):
     source_batch_id: int
     source_query_ids: list[str]
     source_qb_ids: list[str] = Field(default_factory=list)
-    family_id: str
+    family_id: str | None = None
+    candidate_group_id: str | None = None
     target_queries: list[str]
     target_qb_ids: list[str] = Field(default_factory=list)
     decision: MVDecision

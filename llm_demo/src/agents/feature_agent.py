@@ -21,15 +21,21 @@ class FeatureAgent(LLMRulesAgent):
             raise ValueError(f"No SQL files found from {raw_artifact}")
 
         extracted_output = self._infer_structured(
-            task="从输入 SQL Text 中提取 QueryBlock，并输出 query_to_qbs 与 qb_to_query 索引。",
+            task=(
+                "从输入 SQL Text 中提取 QueryBlock 事实结构，并输出 query_to_qbs 与 qb_to_query 索引；"
+                "不要保留 SQL alias，不要生成 complexity_type、block_shape、family_key 或 batch 判断。"
+            ),
             context={"run_id": self.store.run_id, "expected_query_ids": [query["query_id"] for query in queries]},
             input_artifacts={"queries": queries},
             output_model=FeatureOutput,
         )
         output = self._infer_structured(
             task=(
-                "对 candidate_feature_output 进行 evaluate：检查 QueryBlock 是否使用物理表名而非 SQL alias，"
-                "检查 query_id/qb_id 索引是否一致；如发现 alias 或不合规字段，直接返回修正后的 FeatureOutput。"
+                "对 candidate_feature_output 进行 evaluate：检查 QueryBlock 是否只包含 SQL 事实结构，"
+                "检查 relation_instances 是否只记录物理表实例，不保留 SQL alias 或 SELECT 输出 alias，"
+                "检查 join_edges、predicates、projections、group_by_exprs、aggregate_exprs 是否使用结构化字段和物理表名，"
+                "检查 query_id/qb_id 索引是否一致；不要生成 complexity_type、block_shape、family_key 或 batch 判断；"
+                "如发现 alias 滥用或不合规字段，直接返回修正后的 FeatureOutput。"
             ),
             context={"run_id": self.store.run_id, "expected_query_ids": [query["query_id"] for query in queries]},
             input_artifacts={"queries": queries, "candidate_feature_output": extracted_output},
@@ -55,7 +61,10 @@ class FeatureAgent(LLMRulesAgent):
         query_with_sql = self._query_with_sql_text(query)
         query_id = query_with_sql["query_id"]
         extracted_output = self._infer_structured(
-            task="从单条输入 SQL Text 中提取 QueryBlock，并输出 query_to_qbs 与 qb_to_query 索引。",
+            task=(
+                "从单条输入 SQL Text 中提取 QueryBlock 事实结构，并输出 query_to_qbs 与 qb_to_query 索引；"
+                "不要保留 SQL alias，不要生成 complexity_type、block_shape、family_key 或 batch 判断。"
+            ),
             context={"run_id": self.store.run_id, "expected_query_ids": [query_id], "attempt": attempt},
             input_artifacts={"query": query_with_sql},
             output_model=FeatureOutput,
@@ -63,8 +72,10 @@ class FeatureAgent(LLMRulesAgent):
         output = self._infer_structured(
             task=(
                 "对 candidate_feature_output 进行 evaluate：检查 outer、CTE、subquery、set branch QueryBlock 是否完整，"
-                "检查是否使用物理表名而非 SQL alias，检查 query_id/qb_id 索引是否一致；"
-                "如发现 alias 或不合规字段，直接返回修正后的 FeatureOutput。"
+                "检查 relation_instances 是否只记录物理表实例，不保留 SQL alias 或 SELECT 输出 alias，"
+                "检查 join_edges、predicates、projections、group_by_exprs、aggregate_exprs 是否使用结构化字段和物理表名，"
+                "检查 query_id/qb_id 索引是否一致；不要生成 complexity_type、block_shape、family_key 或 batch 判断；"
+                "如发现 alias 滥用或不合规字段，直接返回修正后的 FeatureOutput。"
             ),
             context={"run_id": self.store.run_id, "expected_query_ids": [query_id], "attempt": attempt},
             input_artifacts={"query": query_with_sql, "candidate_feature_output": extracted_output},

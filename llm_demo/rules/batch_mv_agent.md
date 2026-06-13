@@ -1,22 +1,24 @@
 # 职责
 
-给定当前 batch 的 historical rewrite SQL Text、原始 QueryBlock、原始 QueryFamily、当前 batch 的 `family_groups`、全局 `materialized_mvs`，生成当前 batch 内的 MV Candidate 和 CTAS SQL。
+给定当前 batch 的 historical rewrite SQL Text、当前 batch 的原始 QueryBlock、batch-local candidate groups、可选 QueryFamily hint、全局 `materialized_mvs`，生成当前 batch 内的 MV Candidate 和 CTAS SQL。
+
+QueryFamily 现在只是辅助 evidence，不再是 batch 内 MV Candidate 的硬边界。MV Candidate 的硬边界是当前 batch 的 `query_ids`、当前 batch 内存在且 supported 的 `source_qb_ids` / `target_qb_ids`，以及可验证的 CTAS / column mapping。
 
 # 调用方式
 
 BatchMVAgent 固定采用两次 LLM + rules 调用：
 
 1. 第一次生成 `candidate_mv_output`。
-2. 第二次 evaluate `candidate_mv_output`，检查并修正是否满足当前 batch、family 边界、shared upstream superset MV、依赖 DAG 和 rewrite 安全约束，最终输出修正后的完整 MV Candidate JSON 与 build SQL。
+2. 第二次 evaluate `candidate_mv_output`，检查并修正是否满足当前 batch、QueryBlock 边界、shared upstream superset MV、依赖 DAG 和 rewrite 安全约束，最终输出修正后的完整 MV Candidate JSON 与 build SQL。
 
 对外落盘的 `batch_{batch_id}_mv_candidates.json` 使用 evaluate 后的最终结果；第一阶段草稿只可作为 debug artifact，不作为 ExecutorAgent 的输入。
 
 # 规则
 
 1. MV Candidate 只能在当前 batch 内生成。
-2. 每个 MV Candidate 必须来自当前 batch 的 Query 或 QueryFamily，不能只因为未来 batch 可能有用而生成。
-3. 每个 MV Candidate 只能绑定一个 `family_id`，不允许跨 family 合并。
-4. 如果发现不同 family 可能共享 MV，只能在 `reason` 或 run log 中记录 family 质量问题；该问题应由 FamilyAgent evaluate 或 SelfIterationAgent 反馈规则处理。
+2. 每个 MV Candidate 必须来自当前 batch 的 QueryBlock，不能只因为未来 batch 可能有用而生成。
+3. `batch_local_candidate_groups` 是 batch 内共享计算边界的主要候选证据；可以使用其中的 `candidate_group_id` 记录候选来源。
+4. `query_family_hints` 只能作为命名、解释、优先级或去重参考；没有 QueryFamily 的 QueryBlock 仍然可以生成 MV Candidate。
 5. 默认采用 ETL shared upstream superset MV 策略。
 6. MV 不要求是某条 workflow SQL 的子集；MV 是多个 workflow SQL 的可复用上游中间结果。
 7. target workflow SQL 应能通过 residual filter、projection、aggregate 或 roll-up 从 MV 重写得到。
@@ -29,31 +31,45 @@ BatchMVAgent 固定采用两次 LLM + rules 调用：
 14. 如果 detail superset MV 也无法证明能安全支持 target Query rewrite，则 `decision = "skip"`。
 15. 只有所有 `target_queries` 共同拥有的 predicate shape 才能进入共享 MV predicate。
 16. 共同 predicate shape 可以做当前 batch 内有限泛化，例如 `date_dim.d_year IN (2000, 2001)`。
-17. 泛化常量集合只能来自当前 batch、当前 family group 中已出现的 QueryBlock。
+17. 泛化常量集合只能来自当前 batch、当前 candidate 涉及的 QueryBlock。
 18. 非共同 predicate shape 不进入共享 MV predicate，必须按 query 记录到 `residual_filters`。
 19. MV 必须保留执行 `residual_filters`、projection 和 roll-up 所需的列或 group-by 粒度。
 20. 不允许为了覆盖未来 batch 直接去掉共同 predicate，或生成覆盖整列范围的宽 MV。
 21. 如果 build SQL 依赖历史 MV，必须在 `depends_on_mv_ids` 中记录直接依赖；不依赖历史 MV 时使用空数组。
 22. `depends_on_mv_ids` 只能引用已成功物化且当前 batch 可见的 MV。
 23. `decision = "materialize"` 的 Candidate 必须包含 `mv_id`、`target_table_name` 和可执行 `build_sql`。
-24. `decision = "materialize"` 的 Candidate 必须包含非空 `source_qb_ids` 和 `target_qb_ids`；这些 QueryBlock 必须属于当前 batch、当前 family，且不能包含 `unsupported_reasons`。
+24. `decision = "materialize"` 的 Candidate 必须包含非空 `source_qb_ids` 和 `target_qb_ids`；这些 QueryBlock 必须属于当前 batch，且不能包含 `unsupported_reasons`。
 25. `decision = "materialize"` 的 Candidate 必须包含非空 `column_mappings`，用于记录源字段到 MV 物理列的映射。
 26. `output_columns` 只能写 MV 的真实物理列名，不能写 `date_dim.d_year` 这类源表限定列名。
 27. 对直接来自物理表字段的 dimension / filter / projection 列，默认不写 `AS`，`mv_column` 直接使用物理源字段名，例如 `date_dim.d_year -> d_year`、`item.i_brand_id -> i_brand_id`。
-28. measure 列必须使用稳定聚合别名，命名规则为 `{agg_func}_{source_column}`，例如 `SUM(store_sales.ss_ext_sales_price)` 对应 `sum_ss_ext_sales_price`；不要丢掉源字段自身的业务前缀。
-29. 只有聚合表达式和普通列同名冲突时才写 `AS mv_column`；无冲突普通列保持 `table.column` 形式，字段来源由 `column_mappings` 记录。
-30. `build_sql` 必须使用 `CREATE TABLE ... AS SELECT ...`，不要使用 `CREATE OR REPLACE TABLE`。
-31. `decision = "skip"` 可以不包含 `build_sql` 和 `mv_id`，但仍需保留 `candidate_id`、`source_batch_id`、`source_query_ids`、`family_id`、`target_queries`、`decision` 和 `reason`。
-32. evaluate 阶段必须检查 `source_batch_id` 是否等于当前 batch。
-33. evaluate 阶段必须检查 `source_query_ids` 和 `target_queries` 是否都属于当前 batch，且不能使用未来 batch Query 作为结构化 target。
-34. evaluate 阶段必须检查每个 Candidate 是否只绑定一个 `family_id`；跨 family Candidate 必须拆回单 family，或记录 family 质量问题并 skip。
-35. evaluate 阶段必须检查 `mv_type` 是否与可证明 rewrite 关系一致：能安全 roll-up 才能使用 `fine_grain_aggregate`，否则 fallback 到 `detail_superset`，仍不安全则 skip。
-36. evaluate 阶段必须检查 `mv_predicates`、`generalized_predicates` 和 `residual_filters`：共同 predicate shape 才能进入 MV predicate，非共同 predicate 必须进入对应 query 的 residual filter。
-37. evaluate 阶段必须检查 `output_columns`、`group_by_exprs` 和 `measure_exprs` 是否保留 residual filter、projection 和 roll-up 所需信息。
-38. evaluate 阶段必须检查 `depends_on_mv_ids` 是否只引用当前 batch 可见的已物化 MV，且不会形成依赖循环。
-39. evaluate 阶段必须检查 `build_sql` 是否与 Candidate spec 对齐，包括 predicate、输出列、group by、measure 和历史 MV 依赖。
-40. 如果 Candidate 只由未来复用价值触发，而没有当前 batch 的 Query 或 QueryFamily 依据，evaluate 必须删除该 Candidate 或改为 `decision = "skip"`。
-41. evaluate 阶段必须检查 `column_mappings` 是否覆盖所有 `output_columns`，且 `source_table.source_column` 来自物理表字段。
+28. measure 列必须使用稳定聚合别名，命名规则严格等于 `{agg_func_lower}_{source_column_lower}`，例如 `SUM(store_sales.ss_ext_sales_price)` 对应 `sum_ss_ext_sales_price`，`SUM(store_sales.ss_sales_price)` 对应 `sum_ss_sales_price`；不要丢掉源字段自身的业务前缀。
+29. measure 的 `build_sql` SELECT alias、`output_columns[]`、`column_mappings[].mv_column` 必须完全一致；禁止使用原查询输出别名或语义别名作为 MV 物理列名，例如 `sum_sun_sales`、`ext_price`、`sales`。
+30. 如果 measure 的 `source_expr` 无法表达为一个聚合函数作用于单一物理源字段，当前阶段必须 `decision = "skip"`，`reason` 使用 `measure_source_lineage_not_supported` 或 `derived_expression_column_mapping_not_supported`；不要为复杂 measure 编造稳定别名。
+31. 只有聚合表达式和普通列同名冲突时才写 `AS mv_column`；无冲突普通列保持 `table.column` 形式，字段来源由 `column_mappings` 记录。
+32. 不允许用 SQL 局部 alias 派生 `mv_column`，例如 `d1_quarter_name`、`d2_quarter_name`、`cd1_marital_status`；`mv_column` 必须来自物理列命名规则和 `column_mappings`，不能泄漏 SQL alias。
+33. 如果同一物理表在同一个 Candidate 中以多个业务角色参与 join，例如 `date_dim d1/d2/d3` 或 `customer_demographics cd1/cd2`，而当前 `column_mappings` 无法稳定表达这些角色，evaluate 阶段必须把该 Candidate 改成 `decision = "skip"`，`reason` 使用 `duplicate_physical_table_role_not_supported`；不要用 alias 列名 materialize，也不要把语义不同的角色强行折叠到同一个物理列名。
+34. `build_sql` 必须使用 `CREATE TABLE ... AS SELECT ...`，不要使用 `CREATE OR REPLACE TABLE`。
+35. `decision = "skip"` 可以不包含 `build_sql`、`mv_id`、`family_id` 和 `candidate_group_id`，但仍需保留 `candidate_id`、`source_batch_id`、`source_query_ids`、`target_queries`、`decision` 和 `reason`。
+36. evaluate 阶段必须检查 `source_batch_id` 是否等于当前 batch。
+37. evaluate 阶段必须检查 `source_query_ids` 和 `target_queries` 是否都属于当前 batch，且不能使用未来 batch Query 作为结构化 target。
+38. evaluate 阶段不得因为缺少 `family_id`、`query_family_hints` 或 `family_groups` 删除 Candidate；只要 Candidate 的 QueryBlock 边界和语义 rewrite 关系可验证，就可以保留。
+39. evaluate 阶段必须检查 `mv_type` 是否与可证明 rewrite 关系一致：能安全 roll-up 才能使用 `fine_grain_aggregate`，否则 fallback 到 `detail_superset`，仍不安全则 skip。
+40. evaluate 阶段必须检查 `mv_predicates`、`generalized_predicates` 和 `residual_filters`：共同 predicate shape 才能进入 MV predicate，非共同 predicate 必须进入对应 query 的 residual filter。
+41. evaluate 阶段必须检查 `output_columns`、`group_by_exprs` 和 `measure_exprs` 是否保留 residual filter、projection 和 roll-up 所需信息。
+42. evaluate 阶段必须检查 `depends_on_mv_ids` 是否只引用当前 batch 可见的已物化 MV，且不会形成依赖循环。
+43. evaluate 阶段必须检查 `build_sql` 是否与 Candidate spec 对齐，包括 predicate、输出列、group by、measure 和历史 MV 依赖。
+44. 如果 Candidate 只由未来复用价值触发，而没有当前 batch 的 QueryBlock 依据，evaluate 必须删除该 Candidate 或改为 `decision = "skip"`。
+45. evaluate 阶段必须检查 `column_mappings` 是否覆盖所有 `output_columns`，且 `source_table.source_column` 来自物理表字段。
+46. 第一次生成 `candidate_mv_output` 时也必须严格满足 BatchMVOutput schema；不要把不完整 Candidate 留给第二次 evaluate 修正。
+47. `column_mappings[]` 中的 `source_expr`、`source_table`、`source_column`、`mv_column`、`role` 都必须是非空字符串，禁止使用 `null`、空字符串或占位符表示未知来源。
+48. `column_mappings` 只能记录可追溯到单一物理表字段的输出列；如果输出列来自 ratio、CASE、多列组合表达式、常量表达式、复杂派生表达式，且当前 schema 无法稳定记录其源字段 lineage，不要为该列生成半残缺 mapping。
+49. 如果一个 `decision = "materialize"` 的 Candidate 需要无法映射到单一 `source_table.source_column` 的输出列，第一次生成阶段就必须直接输出 `decision = "skip"`，`reason` 使用 `column_mapping_source_not_supported` 或 `derived_expression_column_mapping_not_supported`；同时使用空 `column_mappings`、空 `output_columns`、`build_sql = null`、`mv_id = null`、`target_table_name = null`。
+50. `column_mappings[].source_column`、`column_mappings[].source_expr`、`output_columns[]` 禁止使用 `*`、`table.*`、`alias.*`；`build_sql` 的 SELECT 列表也禁止使用 `SELECT *` 或 `SELECT table.*`。
+51. `detail_superset` 也必须显式列出 rewrite 所需的物理字段和对应 `column_mappings`，不能用通配符代表整行或整张表。
+52. 如果 Candidate 需要整行、整表或 wildcard lineage 才能表达，当前阶段必须直接输出 `decision = "skip"`，`reason` 使用 `wildcard_column_mapping_not_supported` 或 `detail_superset_wildcard_not_supported`；不要自动展开整表字段，也不要 materialize 宽表候选。
+53. `family_id` 是可选 hint 字段。如果使用，优先复制 `query_family_hints[].family_id`；如果没有合适 hint，可以省略 `family_id`，并使用 `candidate_group_id` 追踪 batch-local group。
+54. 如果 `current_batch.family_groups` 为空，仍然可以基于当前 batch 的 supported QueryBlock 和 `batch_local_candidate_groups` 生成 MV Candidate。
+55. `materialized_mvs`、`complexity_batches`、QueryFamily hint 和历史 rewrite 只能作为可见性、依赖和上下文参考，不能作为跨 batch target 的依据。
 
 # 示例 1：q42/q52 生成 fine-grain aggregate superset MV
 

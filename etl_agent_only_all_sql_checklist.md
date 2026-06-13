@@ -153,9 +153,11 @@
   - `join_filter_groupby`
   - `other`
 - [ ] batch 执行单位是完整 SQL / `query_id`。
-- [ ] 一个 SQL 的顶层 batch 由代码层 canonical rules 根据可用 QueryBlock 的最高结构复杂度决定。
-- [ ] `join + group_by/aggregate` 即使没有 filter，也归入 `join_filter_groupby`。
-- [ ] `other` 只作为没有可用 QueryBlock 或无法归入前三类时的兜底 batch。
+- [ ] 一个 SQL 的顶层 batch 由代码层 canonical rules 根据完整 SQL 的 QueryBlock 结构信号汇总决定。
+- [ ] 带 `unsupported_reasons` 的 QueryBlock 可以贡献 SQL 级复杂度信号，但不能进入 `family_groups` / MV Candidate / rewrite target。
+- [ ] 完整 SQL 中同时存在 join 与有物理输入域的 group/aggregate/window/having/rollup 信号时，即使二者不在同一个 QueryBlock，也归入 `join_filter_groupby`。
+- [ ] 没有 `tables` 和 `join_edges` 的纯派生 wrapper 聚合不单独把 SQL 抬到 `join_filter_groupby`。
+- [ ] `other` 只作为完整 SQL 结构信号无法归入前三类时的兜底 batch。
 - [ ] `family_groups` 只作为 batch 内组织信息。
 - [ ] 顶层 `query_ids` 必须去重；同一 SQL 可出现在多个 `family_groups`，但最终 rewrite / execution 只能发生一次。
 - [ ] `family_groups[].qb_ids` 只包含可用 QueryBlock，不包含带 `unsupported_reasons` 的 QueryBlock。

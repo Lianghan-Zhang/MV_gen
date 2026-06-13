@@ -48,12 +48,16 @@ class RewriteAgent(LLMRulesAgent):
         materialized_mvs = self.store.read_json(mv_state_path)
         query_blocks = self.store.read_json(qb_path)
         queries = self._load_current_batch_queries(manifest_path, current_batch.get("query_ids", []))
+        current_query_blocks = self._query_blocks_for_queries(
+            query_blocks.get("query_blocks", []),
+            current_batch.get("query_ids", []),
+        )
 
         input_artifacts = {
             "rewrite_stage": rewrite_stage,
             "current_batch": current_batch,
             "queries": queries,
-            **query_blocks,
+            "query_blocks": current_query_blocks,
             "materialized_mvs": materialized_mvs,
         }
         candidate_output = self._infer_structured(
@@ -71,6 +75,13 @@ class RewriteAgent(LLMRulesAgent):
             input_artifacts={**input_artifacts, "candidate_rewrite_output": candidate_output},
             output_model=RewriteOutput,
         )
+        output, normalization_events = self._normalize_output_scope(
+            output=output,
+            current_batch=current_batch,
+            queries=queries,
+            rewrite_stage=rewrite_stage,
+            batch_id=batch_id,
+        )
         if rewrite_stage == "final":
             output = self._repair_final_order_limit(
                 output=output,
@@ -79,6 +90,14 @@ class RewriteAgent(LLMRulesAgent):
                 queries=queries,
                 batch_id=batch_id,
             )
+            output, repair_normalization_events = self._normalize_output_scope(
+                output=output,
+                current_batch=current_batch,
+                queries=queries,
+                rewrite_stage=rewrite_stage,
+                batch_id=batch_id,
+            )
+            normalization_events.extend(repair_normalization_events)
         output = self._apply_safety_fallbacks(output, materialized_mvs, queries, rewrite_stage)
         self._validate_output(output, current_batch, materialized_mvs, query_blocks["query_blocks"], batch_id, rewrite_stage)
 
@@ -97,6 +116,7 @@ class RewriteAgent(LLMRulesAgent):
                 "rewrite_stage": rewrite_stage,
                 "query_ids": current_batch.get("query_ids", []),
                 "rewrite_statuses": {record["query_id"]: record["status"] for record in output["rewrites"]},
+                "scope_normalization_events": normalization_events,
             },
         )
         return rewrite_dir
@@ -132,6 +152,90 @@ class RewriteAgent(LLMRulesAgent):
                 }
             )
         return queries
+
+    def _query_blocks_for_queries(self, query_blocks: list[dict[str, Any]], query_ids: list[str]) -> list[dict[str, Any]]:
+        query_id_set = set(query_ids)
+        return [block for block in query_blocks if block.get("query_id") in query_id_set]
+
+    def _normalize_output_scope(
+        self,
+        *,
+        output: dict[str, Any],
+        current_batch: dict[str, Any],
+        queries: list[dict[str, str]],
+        rewrite_stage: str,
+        batch_id: int,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        expected_query_ids = list(current_batch.get("query_ids", []))
+        expected_query_id_set = set(expected_query_ids)
+        queries_by_id = {query["query_id"]: query for query in queries}
+        record_by_query: dict[str, dict[str, Any]] = {}
+        dropped_extra_query_ids: list[str] = []
+        duplicate_query_ids: list[str] = []
+
+        for record in output.get("rewrites", []):
+            query_id = record.get("query_id")
+            if query_id not in expected_query_id_set:
+                dropped_extra_query_ids.append(query_id)
+                continue
+            if query_id in record_by_query:
+                duplicate_query_ids.append(query_id)
+            record_by_query[query_id] = record
+
+        missing_query_ids = [query_id for query_id in expected_query_ids if query_id not in record_by_query]
+        for query_id in missing_query_ids:
+            record_by_query[query_id] = self._original_equivalent_rewrite_record(
+                query=queries_by_id[query_id],
+                rewrite_stage=rewrite_stage,
+                batch_id=batch_id,
+                fallback_reason="rewrite_output_missing_query",
+            )
+
+        output["rewrites"] = [record_by_query[query_id] for query_id in expected_query_ids]
+        events = []
+        if dropped_extra_query_ids:
+            events.append({"event": "dropped_extra_query_ids", "query_ids": dropped_extra_query_ids})
+        if duplicate_query_ids:
+            events.append({"event": "deduped_query_ids", "query_ids": duplicate_query_ids})
+        if missing_query_ids:
+            events.append(
+                {
+                    "event": "filled_missing_query_ids",
+                    "query_ids": missing_query_ids,
+                    "fallback_reason": "rewrite_output_missing_query",
+                }
+            )
+        return output, events
+
+    def _original_equivalent_rewrite_record(
+        self,
+        *,
+        query: dict[str, str],
+        rewrite_stage: str,
+        batch_id: int,
+        fallback_reason: str,
+    ) -> dict[str, Any]:
+        query_id = query["query_id"]
+        rewrite_dir_relative = f"05_rewritten_sql/batch_{batch_id}/{rewrite_stage}_rewrite"
+        return {
+            "query_id": query_id,
+            "rewrite_stage": rewrite_stage,
+            "status": "fallback",
+            "used_mv_ids": [],
+            "original_sql_path": query["original_sql_path"],
+            "rewritten_sql_path": str(self.store.path(f"{rewrite_dir_relative}/{query_id}_rewritten.sql")),
+            "rewrite_meta_path": str(self.store.path(f"{rewrite_dir_relative}/{query_id}_rewrite_meta.json")),
+            "rewrite_mode": "original_equivalent",
+            "target_qb_ids": [],
+            "rewritten_sql": query["original_sql"],
+            "residual_filters": [],
+            "rollup_exprs": [],
+            "semantic_check": {
+                "status": "fallback",
+                "reason": f"original-equivalent fallback generated by RewriteAgent scope normalization: {fallback_reason}",
+            },
+            "fallback_reason": fallback_reason,
+        }
 
     def _resolve_sql_path(self, manifest_item: dict[str, Any]) -> Path:
         sql_path = Path(manifest_item["sql_path"])

@@ -62,7 +62,7 @@ class FamilyCandidateBuilder:
         tables = self._normalized_set(block.get("tables", []))
         facts = sorted(table for table in tables if table in TPCDS_FACT_TABLES)
         family_type = "fact_based" if facts else "dimension_only"
-        join_signature = self._normalized_set(block.get("join_edges", []))
+        join_signature = self._normalized_join_edges(block.get("join_edges", []))
         return "|".join(
             [
                 family_type,
@@ -74,10 +74,16 @@ class FamilyCandidateBuilder:
 
     def _candidate(self, candidate_id: int, blocks: list[dict[str, Any]], unsupported_qb_ids: list[str]) -> dict[str, Any]:
         table_sets = [set(self._normalized_set(block.get("tables", []))) for block in blocks]
-        predicate_sets = [set(self._normalized_set(block.get("predicates", []))) for block in blocks]
-        group_by_sets = [set(self._normalized_set(block.get("group_by_exprs", []))) for block in blocks]
-        measure_sets = [set(self._normalized_set(block.get("aggregate_exprs", []))) for block in blocks]
-        join_sets = [set(self._normalized_set(block.get("join_edges", []))) for block in blocks]
+        predicate_sets = [
+            set(self._normalized_expressions(block.get("predicates", []), ("predicate_shape", "expr")))
+            for block in blocks
+        ]
+        group_by_sets = [
+            set(self._normalized_expressions(block.get("group_by_exprs", []), ("expr",)))
+            for block in blocks
+        ]
+        measure_sets = [set(self._normalized_aggregates(block.get("aggregate_exprs", []))) for block in blocks]
+        join_sets = [set(self._normalized_join_edges(block.get("join_edges", []))) for block in blocks]
         all_tables = sorted(set().union(*table_sets)) if table_sets else []
         core_facts = sorted(table for table in all_tables if table in TPCDS_FACT_TABLES)
         family_type = "fact_based" if core_facts else "dimension_only"
@@ -96,9 +102,9 @@ class FamilyCandidateBuilder:
                     "qb_id": block["qb_id"],
                     "query_id": block["query_id"],
                     "tables": self._normalized_set(block.get("tables", [])),
-                    "predicates": self._normalized_set(block.get("predicates", [])),
-                    "group_by_exprs": self._normalized_set(block.get("group_by_exprs", [])),
-                    "aggregate_exprs": self._normalized_set(block.get("aggregate_exprs", [])),
+                    "predicates": self._normalized_expressions(block.get("predicates", []), ("predicate_shape", "expr")),
+                    "group_by_exprs": self._normalized_expressions(block.get("group_by_exprs", []), ("expr",)),
+                    "aggregate_exprs": self._normalized_aggregates(block.get("aggregate_exprs", [])),
                 }
                 for block in blocks
             ],
@@ -111,10 +117,10 @@ class FamilyCandidateBuilder:
         for left, right in list(combinations(blocks, 2))[:20]:
             left_tables = set(self._normalized_set(left.get("tables", [])))
             right_tables = set(self._normalized_set(right.get("tables", [])))
-            left_predicates = set(self._normalized_set(left.get("predicates", [])))
-            right_predicates = set(self._normalized_set(right.get("predicates", [])))
-            left_measures = set(self._normalized_set(left.get("aggregate_exprs", [])))
-            right_measures = set(self._normalized_set(right.get("aggregate_exprs", [])))
+            left_predicates = set(self._normalized_expressions(left.get("predicates", []), ("predicate_shape", "expr")))
+            right_predicates = set(self._normalized_expressions(right.get("predicates", []), ("predicate_shape", "expr")))
+            left_measures = set(self._normalized_aggregates(left.get("aggregate_exprs", [])))
+            right_measures = set(self._normalized_aggregates(right.get("aggregate_exprs", [])))
             evidence.append(
                 {
                     "left_qb_id": left["qb_id"],
@@ -134,7 +140,60 @@ class FamilyCandidateBuilder:
         return "|".join([family_type, ",".join(core_facts), ",".join(all_tables), ",".join(join_signature)])
 
     def _normalized_set(self, values: list[Any]) -> list[str]:
-        return sorted({str(value).strip().lower() for value in values if str(value).strip()})
+        return sorted({str(value).strip().lower() for value in values if value is not None and str(value).strip()})
+
+    def _normalized_join_edges(self, values: list[Any]) -> list[str]:
+        return sorted({signature for value in values if (signature := self._join_edge_signature(value))})
+
+    def _normalized_expressions(self, values: list[Any], preferred_keys: tuple[str, ...]) -> list[str]:
+        return sorted({signature for value in values if (signature := self._expression_signature(value, preferred_keys))})
+
+    def _normalized_aggregates(self, values: list[Any]) -> list[str]:
+        return sorted({signature for value in values if (signature := self._aggregate_signature(value))})
+
+    def _join_edge_signature(self, value: Any) -> str:
+        if not isinstance(value, dict):
+            return str(value).strip().lower()
+
+        left = self._column_ref(value.get("left_table"), value.get("left_column"))
+        right = self._column_ref(value.get("right_table"), value.get("right_column"))
+        operator = str(value.get("operator") or "=").strip().lower()
+        if left and right:
+            if operator == "=" and right < left:
+                left, right = right, left
+            return f"{left}{operator}{right}"
+        return self._expression_signature(value, ("expr",))
+
+    def _expression_signature(self, value: Any, preferred_keys: tuple[str, ...]) -> str:
+        if not isinstance(value, dict):
+            return str(value).strip().lower()
+
+        for key in preferred_keys:
+            raw_value = value.get(key)
+            if raw_value is not None and str(raw_value).strip():
+                return str(raw_value).strip().lower()
+
+        columns = value.get("columns") or []
+        if columns:
+            return ",".join(self._normalized_set(columns))
+        return ""
+
+    def _aggregate_signature(self, value: Any) -> str:
+        if not isinstance(value, dict):
+            return str(value).strip().lower()
+
+        agg_func = str(value.get("agg_func") or "").strip().lower()
+        source_ref = self._column_ref(value.get("source_table"), value.get("source_column"))
+        if agg_func and source_ref:
+            return f"{agg_func}({source_ref})"
+        return self._expression_signature(value, ("expr",))
+
+    def _column_ref(self, table: Any, column: Any) -> str:
+        table_name = str(table or "").strip().lower()
+        column_name = str(column or "").strip().lower()
+        if not table_name or not column_name:
+            return ""
+        return f"{table_name}.{column_name}"
 
     def _jaccard(self, left: set[str], right: set[str]) -> float:
         if not left and not right:

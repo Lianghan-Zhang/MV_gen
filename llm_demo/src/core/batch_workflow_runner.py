@@ -20,14 +20,14 @@ class BatchWorkflowRunner:
         complexity_batches_path: str | Path,
         sql_manifest_path: str | Path,
         query_blocks_path: str | Path,
-        families_path: str | Path,
+        families_path: str | Path | None = None,
         materialized_mvs_path: str | Path | None = None,
     ) -> list[Path]:
         started_at = time.monotonic()
         batches_path = Path(complexity_batches_path)
         manifest_path = Path(sql_manifest_path)
         qb_path = Path(query_blocks_path)
-        family_path = Path(families_path)
+        family_path = Path(families_path) if families_path else None
         mv_state_path = Path(materialized_mvs_path) if materialized_mvs_path else self.store.materialized_mvs_path
         output_paths: list[Path] = []
 
@@ -80,7 +80,11 @@ class BatchWorkflowRunner:
         self.store.append_run_log(
             agent_name="BatchWorkflowRunner",
             event="success",
-            input_artifact_paths=[batches_path, manifest_path, qb_path, family_path],
+            input_artifact_paths=[
+                path
+                for path in [batches_path, manifest_path, qb_path, family_path]
+                if path is not None
+            ],
             output_artifact_paths=output_paths,
             elapsed_ms=int((time.monotonic() - started_at) * 1000),
             details={"processed_batch_ids": [batch["batch_id"] for batch in batches if batch.get("query_ids")]},

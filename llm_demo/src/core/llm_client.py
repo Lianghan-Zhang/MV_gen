@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+import httpx
 from openai import OpenAI
 
 
@@ -24,7 +25,13 @@ class LLMClient:
         self.model = self._required_env("DEEPSEEK_MODEL")
         self.temperature = float(os.getenv("LLM_TEMPERATURE", "0.2"))
         self.max_retries = int(os.getenv("LLM_MAX_RETRIES", "2"))
-        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        self.timeout_seconds = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
+        self.connect_timeout_seconds = float(os.getenv("LLM_CONNECT_TIMEOUT_SECONDS", "60"))
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=httpx.Timeout(self.timeout_seconds, connect=self.connect_timeout_seconds),
+        )
 
     def infer(self, prompt: str, load_json: bool = True) -> str | dict[str, Any]:
         last_error: Exception | None = None
@@ -44,7 +51,13 @@ class LLMClient:
                 if attempt >= self.max_retries:
                     break
                 time.sleep(1 + attempt)
-        raise RuntimeError(f"LLM inference failed: {last_error}") from last_error
+        raise RuntimeError(
+            "LLM inference failed after "
+            f"{self.max_retries + 1} attempts "
+            f"(model={self.model}, base_url={self.base_url}, "
+            f"timeout={self.timeout_seconds}s, connect_timeout={self.connect_timeout_seconds}s): "
+            f"{last_error}"
+        ) from last_error
 
     def _required_env(self, name: str) -> str:
         value = os.getenv(name)

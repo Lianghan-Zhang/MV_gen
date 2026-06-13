@@ -390,33 +390,171 @@ def write_batch_cluster_inputs(
     return query_blocks_path, families_path
 
 
-def wrong_batch_output(query_id: str, wrong_batch_id: int) -> dict:
+def batch_cluster_output(
+    assignments: dict[int, list[str]],
+    family_groups_by_batch: dict[int, list[dict]] | None = None,
+) -> dict:
+    family_groups_by_batch = family_groups_by_batch or {}
     batches = []
-    for batch_id, batch_type in ((1, "join"), (2, "join_filter"), (3, "join_filter_groupby"), (4, "other")):
+    for batch_id, batch_type in (
+        (1, "Batch-1"),
+        (2, "Batch-2"),
+        (3, "Batch-3"),
+        (4, "Batch-4"),
+        (5, "Batch-5"),
+        (6, "Other"),
+    ):
         batches.append(
             {
                 "batch_id": batch_id,
                 "batch_type": batch_type,
-                "query_ids": [query_id] if batch_id == wrong_batch_id else [],
-                "family_groups": [],
+                "query_ids": assignments.get(batch_id, []),
+                "family_groups": family_groups_by_batch.get(batch_id, []),
             }
         )
     return {"complexity_batches": batches}
 
 
-def empty_batch_output() -> dict:
-    return {
-        "complexity_batches": [
-            {"batch_id": 1, "batch_type": "join", "query_ids": [], "family_groups": []},
-            {"batch_id": 2, "batch_type": "join_filter", "query_ids": [], "family_groups": []},
-            {"batch_id": 3, "batch_type": "join_filter_groupby", "query_ids": [], "family_groups": []},
-            {"batch_id": 4, "batch_type": "other", "query_ids": [], "family_groups": []},
-        ]
-    }
+def test_batch_cluster_uses_classification_csv_labels_as_batch_type() -> None:
+    store = make_store("test_batch_cluster_csv_labels")
+    sql_manifest_path = SQLLoaderAgent(store).run(SQL_PATHS)
+    query_blocks_path, families_path = write_batch_cluster_inputs(
+        store,
+        query_blocks=[
+            {
+                "qb_id": "q42.outer",
+                "query_id": "q42",
+                "scope_type": "outer",
+                "tables": ["date_dim", "store_sales", "item"],
+                "join_edges": ["store_sales.ss_item_sk = item.i_item_sk"],
+                "predicates": ["date_dim.d_year = 2000"],
+                "group_by_exprs": ["date_dim.d_year"],
+                "aggregate_exprs": ["SUM(store_sales.ss_ext_sales_price)"],
+                "complexity_type": "join_filter_groupby",
+                "family_key": "store_sales-date_dim-item",
+                "unsupported_reasons": [],
+            },
+            {
+                "qb_id": "q52.outer",
+                "query_id": "q52",
+                "scope_type": "outer",
+                "tables": ["date_dim", "store_sales", "item"],
+                "join_edges": ["store_sales.ss_item_sk = item.i_item_sk"],
+                "predicates": ["date_dim.d_year = 2000"],
+                "group_by_exprs": ["date_dim.d_year"],
+                "aggregate_exprs": ["SUM(store_sales.ss_ext_sales_price)"],
+                "complexity_type": "join_filter_groupby",
+                "family_key": "store_sales-date_dim-item",
+                "unsupported_reasons": [],
+            },
+        ],
+        query_to_qbs={"q42": ["q42.outer"], "q52": ["q52.outer"]},
+        query_families=[
+            {
+                "family_id": "family_store_sales_date_dim_item",
+                "family_key": "store_sales-date_dim-item",
+                "members": ["q42.outer", "q52.outer"],
+            }
+        ],
+    )
+    classification_csv_path = store.write_text(
+        "classification.csv",
+        "SQL,Batch,Reason\n"
+        "q42.sql,Batch-1,seed query\n"
+        "q52.sql,Batch-3,changed batch method\n",
+    )
+
+    batches_path = BatchClusterAgent(store, StaticLLM([])).run_from_classification_csv(
+        classification_csv_path=classification_csv_path,
+        sql_manifest_path=sql_manifest_path,
+        query_blocks_path=query_blocks_path,
+        families_path=families_path,
+    )
+
+    batches = {batch["batch_id"]: batch for batch in store.read_json(batches_path)["complexity_batches"]}
+    assert [(batch_id, batches[batch_id]["batch_type"]) for batch_id in sorted(batches)] == [
+        (1, "Batch-1"),
+        (2, "Batch-2"),
+        (3, "Batch-3"),
+        (4, "Batch-4"),
+        (5, "Batch-5"),
+        (6, "Other"),
+    ]
+    assert batches[1]["query_ids"] == ["q42"]
+    assert batches[3]["query_ids"] == ["q52"]
+    assert batches[1]["family_groups"] == [
+        {
+            "family_id": "family_store_sales_date_dim_item",
+            "query_ids": ["q42"],
+            "qb_ids": ["q42.outer"],
+        }
+    ]
+    assert batches[3]["family_groups"] == [
+        {
+            "family_id": "family_store_sales_date_dim_item",
+            "query_ids": ["q52"],
+            "qb_ids": ["q52.outer"],
+        }
+    ]
+    records = [json.loads(line) for line in store.run_log_path.read_text(encoding="utf-8").splitlines()]
+    batch_record = next(record for record in records if record["agent_name"] == "BatchClusterAgent")
+    assert batch_record["details"]["mode"] == "classification_csv"
+    assert batch_record["details"]["sqlglot_parsed_query_count"] == 2
 
 
-def test_batch_cluster_canonicalizes_q1_cte_over_unsupported_outer() -> None:
-    store = make_store("test_batch_cluster_q1_canonical")
+def test_batch_cluster_csv_does_not_require_families_path() -> None:
+    store = make_store("test_batch_cluster_csv_without_families")
+    sql_manifest_path = SQLLoaderAgent(store).run(SQL_PATHS)
+    query_blocks_path, _families_path = write_batch_cluster_inputs(
+        store,
+        query_blocks=[
+            {
+                "qb_id": "q42.outer",
+                "query_id": "q42",
+                "scope_type": "outer",
+                "tables": ["date_dim", "store_sales", "item"],
+                "join_edges": ["store_sales.ss_item_sk = item.i_item_sk"],
+                "predicates": ["date_dim.d_year = 2000"],
+                "group_by_exprs": ["date_dim.d_year"],
+                "aggregate_exprs": ["SUM(store_sales.ss_ext_sales_price)"],
+                "unsupported_reasons": [],
+            },
+            {
+                "qb_id": "q52.outer",
+                "query_id": "q52",
+                "scope_type": "outer",
+                "tables": ["date_dim", "store_sales", "item"],
+                "join_edges": ["store_sales.ss_item_sk = item.i_item_sk"],
+                "predicates": ["date_dim.d_year = 2000"],
+                "group_by_exprs": ["date_dim.d_year"],
+                "aggregate_exprs": ["SUM(store_sales.ss_ext_sales_price)"],
+                "unsupported_reasons": [],
+            },
+        ],
+        query_to_qbs={"q42": ["q42.outer"], "q52": ["q52.outer"]},
+        query_families=[],
+    )
+    classification_csv_path = store.write_text(
+        "classification.csv",
+        "SQL,Batch,Reason\n"
+        "q42.sql,Batch-1,seed query\n"
+        "q52.sql,Batch-3,changed batch method\n",
+    )
+
+    batches_path = BatchClusterAgent(store, StaticLLM([])).run_from_classification_csv(
+        classification_csv_path=classification_csv_path,
+        sql_manifest_path=sql_manifest_path,
+        query_blocks_path=query_blocks_path,
+    )
+
+    batches = {batch["batch_id"]: batch for batch in store.read_json(batches_path)["complexity_batches"]}
+    assert batches[1]["query_ids"] == ["q42"]
+    assert batches[3]["query_ids"] == ["q52"]
+    assert all(not batch["family_groups"] for batch in batches.values())
+
+
+def test_batch_cluster_accepts_q1_batch_3_from_rules() -> None:
+    store = make_store("test_batch_cluster_q1_rules")
     query_blocks_path, families_path = write_batch_cluster_inputs(
         store,
         query_blocks=[
@@ -457,7 +595,20 @@ def test_batch_cluster_canonicalizes_q1_cte_over_unsupported_outer() -> None:
         ],
     )
 
-    batches_path = BatchClusterAgent(store, StaticLLM([wrong_batch_output("q1", 4), wrong_batch_output("q1", 4)])).run(
+    llm_output = batch_cluster_output(
+        {3: ["q1"]},
+        {
+            3: [
+                {
+                    "family_id": "family_store_returns_date_dim",
+                    "query_ids": ["q1"],
+                    "qb_ids": ["q1.cte.customer_total_return"],
+                }
+            ]
+        },
+    )
+
+    batches_path = BatchClusterAgent(store, StaticLLM([llm_output, llm_output])).run(
         query_blocks_path,
         families_path,
     )
@@ -474,11 +625,12 @@ def test_batch_cluster_canonicalizes_q1_cte_over_unsupported_outer() -> None:
     ]
     records = [json.loads(line) for line in store.run_log_path.read_text(encoding="utf-8").splitlines()]
     batch_record = next(record for record in records if record["agent_name"] == "BatchClusterAgent")
-    assert batch_record["details"]["corrected_query_ids"] == {"q1": {"llm_batch": 4, "canonical_batch": 3}}
+    assert "batch_rules_path" not in batch_record["details"]
+    assert str(PROJECT_ROOT / "batch_rules.md") not in batch_record["input_artifact_paths"]
 
 
-def test_batch_cluster_classifies_q11_join_aggregate_branch_as_batch_3() -> None:
-    store = make_store("test_batch_cluster_q11_canonical")
+def test_batch_cluster_accepts_q11_cross_channel_sales_as_batch_4() -> None:
+    store = make_store("test_batch_cluster_q11_rules")
     query_blocks_path, families_path = write_batch_cluster_inputs(
         store,
         query_blocks=[
@@ -543,24 +695,219 @@ def test_batch_cluster_classifies_q11_join_aggregate_branch_as_batch_3() -> None
         ],
     )
 
-    batches_path = BatchClusterAgent(store, StaticLLM([wrong_batch_output("q11", 2), wrong_batch_output("q11", 2)])).run(
+    llm_output = batch_cluster_output(
+        {4: ["q11"]},
+        {
+            4: [
+                {
+                    "family_id": "family_customer_store_sales_date_dim",
+                    "query_ids": ["q11"],
+                    "qb_ids": ["q11.year_total.branch1"],
+                },
+                {
+                    "family_id": "family_customer_web_sales_date_dim",
+                    "query_ids": ["q11"],
+                    "qb_ids": ["q11.year_total.branch2"],
+                },
+            ]
+        },
+    )
+
+    batches_path = BatchClusterAgent(store, StaticLLM([llm_output, llm_output])).run(
         query_blocks_path,
         families_path,
     )
 
     batches = {batch["batch_id"]: batch for batch in store.read_json(batches_path)["complexity_batches"]}
-    assert batches[2]["query_ids"] == []
-    assert batches[3]["query_ids"] == ["q11"]
+    assert batches[3]["query_ids"] == []
+    assert batches[4]["query_ids"] == ["q11"]
     assert {
         group["family_id"]: group["qb_ids"]
-        for group in batches[3]["family_groups"]
+        for group in batches[4]["family_groups"]
     } == {
         "family_customer_store_sales_date_dim": ["q11.year_total.branch1"],
         "family_customer_web_sales_date_dim": ["q11.year_total.branch2"],
     }
-    records = [json.loads(line) for line in store.run_log_path.read_text(encoding="utf-8").splitlines()]
-    batch_record = next(record for record in records if record["agent_name"] == "BatchClusterAgent")
-    assert batch_record["details"]["corrected_query_ids"] == {"q11": {"llm_batch": 2, "canonical_batch": 3}}
+
+
+def test_batch_cluster_uses_full_sql_complexity_even_when_mv_blocks_are_unsupported() -> None:
+    store = make_store("test_batch_cluster_full_sql_complexity")
+    query_blocks_path, families_path = write_batch_cluster_inputs(
+        store,
+        query_blocks=[
+            {
+                "qb_id": "q44.outer",
+                "query_id": "q44",
+                "scope_type": "outer",
+                "tables": ["item"],
+                "join_edges": ["item.i_item_sk = asceding.item_sk"],
+                "predicates": [],
+                "group_by_exprs": [],
+                "aggregate_exprs": [],
+                "complexity_type": "join",
+                "family_key": "item-derived_rank",
+                "unsupported_reasons": [],
+            },
+            {
+                "qb_id": "q44.subquery.rank_source",
+                "query_id": "q44",
+                "scope_type": "subquery",
+                "tables": ["store_sales"],
+                "join_edges": [],
+                "predicates": ["store_sales.ss_store_sk = 4"],
+                "group_by_exprs": ["store_sales.ss_item_sk"],
+                "aggregate_exprs": ["avg(store_sales.ss_net_profit)"],
+                "structural_flags": ["has_window", "has_having"],
+                "complexity_type": "other",
+                "family_key": "store_sales",
+                "unsupported_reasons": [],
+            },
+            {
+                "qb_id": "q5.cte.ssr",
+                "query_id": "q5",
+                "scope_type": "cte",
+                "tables": ["store_sales", "store_returns", "date_dim", "store"],
+                "join_edges": [
+                    "salesreturns.date_sk = date_dim.d_date_sk",
+                    "salesreturns.store_sk = store.s_store_sk",
+                ],
+                "predicates": ["date_dim.d_date BETWEEN start_date AND end_date"],
+                "group_by_exprs": ["store.s_store_id"],
+                "aggregate_exprs": ["sum(sales_price)"],
+                "structural_flags": ["has_group_by"],
+                "complexity_type": "join_filter_groupby",
+                "family_key": "store_sales-store_returns-date_dim-store",
+                "unsupported_reasons": ["salesreturns is a derived union output"],
+            },
+            {
+                "qb_id": "q5.wsr.salesreturns.branch2",
+                "query_id": "q5",
+                "scope_type": "set_branch",
+                "tables": ["web_returns", "web_sales"],
+                "join_edges": [
+                    "web_returns.wr_item_sk = web_sales.ws_item_sk",
+                    "web_returns.wr_order_number = web_sales.ws_order_number",
+                ],
+                "predicates": [],
+                "group_by_exprs": [],
+                "aggregate_exprs": [],
+                "complexity_type": "join",
+                "family_key": "web_returns-web_sales",
+                "unsupported_reasons": [],
+            },
+            {
+                "qb_id": "q38.outer",
+                "query_id": "q38",
+                "scope_type": "outer",
+                "tables": [],
+                "join_edges": [],
+                "predicates": [],
+                "group_by_exprs": [],
+                "aggregate_exprs": ["count(*)"],
+                "complexity_type": "other",
+                "family_key": "",
+                "unsupported_reasons": [],
+            },
+            {
+                "qb_id": "q38.set_branch.store",
+                "query_id": "q38",
+                "scope_type": "set_branch",
+                "tables": ["store_sales", "date_dim", "customer"],
+                "join_edges": [
+                    "store_sales.ss_sold_date_sk = date_dim.d_date_sk",
+                    "store_sales.ss_customer_sk = customer.c_customer_sk",
+                ],
+                "predicates": ["date_dim.d_month_seq BETWEEN 1200 AND 1211"],
+                "group_by_exprs": [],
+                "aggregate_exprs": [],
+                "complexity_type": "join_filter",
+                "family_key": "store_sales-date_dim-customer",
+                "unsupported_reasons": [],
+            },
+        ],
+        query_to_qbs={
+            "q44": ["q44.outer", "q44.subquery.rank_source"],
+            "q5": ["q5.cte.ssr", "q5.wsr.salesreturns.branch2"],
+            "q38": ["q38.outer", "q38.set_branch.store"],
+        },
+        query_families=[
+            {
+                "family_id": "family_empty_no_tables",
+                "family_key": "",
+                "members": ["q38.outer"],
+            },
+            {
+                "family_id": "family_item_rank_join",
+                "family_key": "item-derived_rank",
+                "members": ["q44.outer"],
+            },
+            {
+                "family_id": "family_q5_unsupported_cte",
+                "family_key": "store_sales-store_returns-date_dim-store",
+                "members": ["q5.cte.ssr"],
+            },
+            {
+                "family_id": "family_web_returns_web_sales",
+                "family_key": "web_returns-web_sales",
+                "members": ["q5.wsr.salesreturns.branch2"],
+            },
+            {
+                "family_id": "family_store_sales_date_dim_customer",
+                "family_key": "store_sales-date_dim-customer",
+                "members": ["q38.set_branch.store"],
+            },
+        ],
+    )
+
+    llm_output = batch_cluster_output(
+        {5: ["q38", "q44", "q5"]},
+        {
+            5: [
+                {
+                    "family_id": "family_item_rank_join",
+                    "query_ids": ["q44"],
+                    "qb_ids": ["q44.outer"],
+                },
+                {
+                    "family_id": "family_web_returns_web_sales",
+                    "query_ids": ["q5"],
+                    "qb_ids": ["q5.wsr.salesreturns.branch2"],
+                },
+                {
+                    "family_id": "family_store_sales_date_dim_customer",
+                    "query_ids": ["q38"],
+                    "qb_ids": ["q38.set_branch.store"],
+                },
+            ]
+        },
+    )
+
+    batches_path = BatchClusterAgent(store, StaticLLM([llm_output, llm_output])).run(
+        query_blocks_path,
+        families_path,
+    )
+
+    batches = {batch["batch_id"]: batch for batch in store.read_json(batches_path)["complexity_batches"]}
+    assert batches[1]["query_ids"] == []
+    assert batches[2]["query_ids"] == []
+    assert batches[5]["query_ids"] == ["q38", "q44", "q5"]
+    assert {
+        group["family_id"]: group["qb_ids"]
+        for group in batches[5]["family_groups"]
+    } == {
+        "family_item_rank_join": ["q44.outer"],
+        "family_web_returns_web_sales": ["q5.wsr.salesreturns.branch2"],
+        "family_store_sales_date_dim_customer": ["q38.set_branch.store"],
+    }
+    assert all(
+        "q5.cte.ssr" not in group["qb_ids"]
+        for batch in batches.values()
+        for group in batch.get("family_groups", [])
+    )
+    assert all(
+        "q38.outer" not in group["qb_ids"]
+        for group in batches[5].get("family_groups", [])
+    )
 
 
 def test_batch_cluster_normalizes_duplicate_family_ids_without_merging_different_families() -> None:
@@ -613,7 +960,25 @@ def test_batch_cluster_normalizes_duplicate_family_ids_without_merging_different
         ],
     )
 
-    batches_path = BatchClusterAgent(store, StaticLLM([empty_batch_output(), empty_batch_output()])).run(
+    llm_output = batch_cluster_output(
+        {2: ["q34", "q46"]},
+        {
+            2: [
+                {
+                    "family_id": "family_customer_customer_address_dn",
+                    "query_ids": ["q34"],
+                    "qb_ids": ["q34.outer"],
+                },
+                {
+                    "family_id": "family_customer_customer_address_dn__2",
+                    "query_ids": ["q46"],
+                    "qb_ids": ["q46.outer"],
+                },
+            ]
+        },
+    )
+
+    batches_path = BatchClusterAgent(store, StaticLLM([llm_output, llm_output])).run(
         query_blocks_path,
         families_path,
     )
@@ -1116,6 +1481,92 @@ def test_batch_mv_agent_rejects_mv_dependency_cycle() -> None:
         )
 
 
+def test_batch_mv_agent_accepts_batch_local_candidate_without_family_groups() -> None:
+    store = make_store("test_batch_mv_batch_local_no_family_groups")
+    batches_path = store.write_json(
+        "03_batches/complexity_batches.json",
+        {
+            "complexity_batches": [
+                {"batch_id": 1, "batch_type": "Batch-1", "query_ids": [], "family_groups": []},
+                {"batch_id": 2, "batch_type": "Batch-2", "query_ids": [], "family_groups": []},
+                {"batch_id": 3, "batch_type": "Batch-3", "query_ids": [], "family_groups": []},
+                {"batch_id": 4, "batch_type": "Batch-4", "query_ids": [], "family_groups": []},
+                {"batch_id": 5, "batch_type": "Batch-5", "query_ids": [], "family_groups": []},
+                {"batch_id": 6, "batch_type": "Other", "query_ids": ["q41"], "family_groups": []},
+            ]
+        },
+    )
+    query_blocks_path = store.write_json(
+        "01_query_blocks/query_blocks.json",
+        {
+            "query_blocks": [
+                {
+                    "qb_id": "q41.outer",
+                    "query_id": "q41",
+                    "scope_type": "outer",
+                    "tables": ["item"],
+                    "join_edges": [],
+                    "predicates": ["item.i_manufact_id BETWEEN 738 AND 778"],
+                    "group_by_exprs": [],
+                    "aggregate_exprs": [],
+                    "unsupported_reasons": [],
+                }
+            ]
+        },
+    )
+    store.write_json("01_query_blocks/query_to_qbs.json", {"q41": ["q41.outer"]})
+    store.write_json("01_query_blocks/qb_to_query.json", {"q41.outer": "q41"})
+    historical_rewrite_dir = write_original_equivalent_historical_rewrite(store, 6, ["q41"])
+    batch_local_output = {
+        "batch_id": 6,
+        "mv_candidates": [
+            {
+                "candidate_id": "cand_batch_6_item_q41_0001",
+                "source_batch_id": 6,
+                "source_query_ids": ["q41"],
+                "source_qb_ids": ["q41.outer"],
+                "candidate_group_id": "batch_local_group_0001",
+                "target_queries": ["q41"],
+                "target_qb_ids": ["q41.outer"],
+                "decision": "materialize",
+                "reason": "batch-local dimension-only candidate without QueryFamily",
+                "mv_id": "mv_item_q41",
+                "mv_type": "dimension_only",
+                "target_table_name": "mv_item_q41",
+                "depends_on_mv_ids": [],
+                "output_columns": ["i_product_name"],
+                "column_mappings": [
+                    {
+                        "source_expr": "item.i_product_name",
+                        "source_table": "item",
+                        "source_column": "i_product_name",
+                        "mv_column": "i_product_name",
+                        "role": "projection",
+                    }
+                ],
+                "build_sql": "CREATE TABLE mv_item_q41 AS SELECT item.i_product_name FROM item",
+            }
+        ],
+    }
+
+    mv_candidates_path = BatchMVAgent(store, StaticLLM([batch_local_output, batch_local_output])).run(
+        6,
+        batches_path,
+        query_blocks_path,
+        None,
+        historical_rewrite_dir,
+    )
+
+    candidates = store.read_json(mv_candidates_path)["mv_candidates"]
+    assert [candidate["candidate_id"] for candidate in candidates] == ["cand_batch_6_item_q41_0001"]
+    assert candidates[0]["family_id"] is None
+    assert candidates[0]["candidate_group_id"] == "batch_local_group_0001"
+    assert "CREATE TABLE mv_item_q41" in store.read_text(store.path("04_batch_mvs/batch_6_mv_build.sql"))
+    records = [json.loads(line) for line in store.run_log_path.read_text(encoding="utf-8").splitlines()]
+    batch_mv_record = next(record for record in records if record["agent_name"] == "BatchMVAgent")
+    assert batch_mv_record["details"]["scope_normalization_events"] == []
+
+
 def test_rewrite_agent_falls_back_when_mv_rewrite_uses_source_qualified_columns() -> None:
     store = make_store("test_rewrite_source_qualified_columns")
     sql_manifest_path = SQLLoaderAgent(store).run([PROJECT_ROOT / "tpcds-spark" / "q42.sql"])
@@ -1140,6 +1591,49 @@ def test_rewrite_agent_falls_back_when_mv_rewrite_uses_source_qualified_columns(
     assert meta["status"] == "fallback"
     assert meta["used_mv_ids"] == []
     assert meta["fallback_reason"] == "mv_uses_source_qualified_columns"
+    assert (rewrite_dir / "q42_rewritten.sql").read_text(encoding="utf-8") == (PROJECT_ROOT / "tpcds-spark" / "q42.sql").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_rewrite_agent_scopes_output_to_current_batch_and_fills_missing_query() -> None:
+    store = make_store("test_rewrite_scope_normalization")
+    sql_manifest_path = SQLLoaderAgent(store).run(
+        [
+            PROJECT_ROOT / "tpcds-spark" / "q42.sql",
+            PROJECT_ROOT / "tpcds-spark" / "q52.sql",
+        ]
+    )
+    batches_path = write_minimal_complexity_batches(store, 3, "join_filter_groupby", ["q42"])
+    query_blocks_path = store.write_json(
+        "01_query_blocks/query_blocks.json",
+        {
+            "query_blocks": [
+                {"qb_id": "q42.outer", "query_id": "q42", "unsupported_reasons": []},
+                {"qb_id": "q52.outer", "query_id": "q52", "unsupported_reasons": []},
+            ]
+        },
+    )
+    mv_state_path = mv_rewrite_state(store)
+    extra_record = rewrite_record(
+        "q52",
+        "SELECT d_year, i_brand_id, i_brand, SUM(sum_ss_ext_sales_price) AS ext_price FROM mv_ok GROUP BY d_year, i_brand_id, i_brand",
+    )
+
+    rewrite_dir = RewriteAgent(store, StaticLLM([{"rewrites": [extra_record]}, {"rewrites": [extra_record]}])).run(
+        3,
+        "final",
+        batches_path,
+        sql_manifest_path,
+        query_blocks_path,
+        mv_state_path,
+    )
+
+    assert not (rewrite_dir / "q52_rewrite_meta.json").exists()
+    meta = store.read_json(rewrite_dir / "q42_rewrite_meta.json")
+    assert meta["status"] == "fallback"
+    assert meta["used_mv_ids"] == []
+    assert meta["fallback_reason"] == "rewrite_output_missing_query"
     assert (rewrite_dir / "q42_rewritten.sql").read_text(encoding="utf-8") == (PROJECT_ROOT / "tpcds-spark" / "q42.sql").read_text(
         encoding="utf-8"
     )
@@ -1343,8 +1837,8 @@ def test_live_batch_cluster_batch_mv_and_self_iteration_agents_produce_artifacts
     batches = store.read_json(batches_path)["complexity_batches"]
     by_type = {batch["batch_type"]: batch for batch in batches}
 
-    target_batch = by_type["join_filter_groupby"]
-    assert target_batch["batch_id"] == 3
+    target_batch = by_type["Batch-1"]
+    assert target_batch["batch_id"] == 1
     assert {"q42", "q52"}.issubset(set(target_batch["query_ids"]))
     assert any(
         {"q42", "q52"}.issubset(set(group["query_ids"]))
@@ -1352,24 +1846,24 @@ def test_live_batch_cluster_batch_mv_and_self_iteration_agents_produce_artifacts
         for group in target_batch["family_groups"]
     )
 
-    historical_rewrite_dir = write_original_equivalent_historical_rewrite(store, 3, ["q42", "q52"])
+    historical_rewrite_dir = write_original_equivalent_historical_rewrite(store, 1, ["q42", "q52"])
     mv_candidates_path = BatchMVAgent(store, llm_client).run(
-        3,
+        1,
         batches_path,
         query_blocks_path,
         families_path,
         historical_rewrite_dir,
     )
     mv_output = store.read_json(mv_candidates_path)
-    assert mv_output["batch_id"] == 3
+    assert mv_output["batch_id"] == 1
     assert mv_output["mv_candidates"]
-    mv_build_sql = store.read_text(store.path("04_batch_mvs/batch_3_mv_build.sql"))
+    mv_build_sql = store.read_text(store.path("04_batch_mvs/batch_1_mv_build.sql"))
     assert "CREATE OR REPLACE TABLE" not in mv_build_sql.upper()
     assert "CREATE TABLE" in mv_build_sql.upper()
     assert store.path("04_batch_mvs/materialized_mvs.json").exists()
 
     for candidate in mv_output["mv_candidates"]:
-        assert candidate["source_batch_id"] == 3
+        assert candidate["source_batch_id"] == 1
         assert candidate["family_id"]
         assert set(candidate["source_query_ids"]).issubset(set(target_batch["query_ids"]))
         assert set(candidate["target_queries"]).issubset(set(target_batch["query_ids"]))

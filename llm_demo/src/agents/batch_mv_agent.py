@@ -7,6 +7,7 @@ from typing import Any
 
 from llm_demo.src.core.agent_base import LLMRulesAgent
 from llm_demo.src.core.artifact_store import ArtifactStore
+from llm_demo.src.core.family_candidate_builder import TPCDS_FACT_TABLES
 from llm_demo.src.core.family_utils import normalize_query_families
 from llm_demo.src.core.llm_client import LLMClient
 from llm_demo.src.core.physical_schema import load_physical_schema, validate_physical_column
@@ -30,14 +31,14 @@ class BatchMVAgent(LLMRulesAgent):
         batch_id: int,
         complexity_batches_path: str | Path,
         query_blocks_path: str | Path,
-        families_path: str | Path,
+        families_path: str | Path | None,
         historical_rewrite_dir: str | Path,
         materialized_mvs_path: str | Path | None = None,
     ) -> Path:
         started_at = time.monotonic()
         batches_path = Path(complexity_batches_path)
         qb_path = Path(query_blocks_path)
-        family_path = Path(families_path)
+        family_path = Path(families_path) if families_path else None
         rewrite_dir = Path(historical_rewrite_dir)
         mv_state_path = self._ensure_materialized_mvs(materialized_mvs_path)
 
@@ -46,40 +47,52 @@ class BatchMVAgent(LLMRulesAgent):
         query_blocks = self.store.read_json(qb_path)
         query_to_qbs = self.store.read_json(qb_path.parent / "query_to_qbs.json")
         qb_to_query = self.store.read_json(qb_path.parent / "qb_to_query.json")
-        families = self.store.read_json(family_path)
-        families["query_families"], family_normalization_events = normalize_query_families(families.get("query_families", []))
+        families, family_normalization_events = self._load_query_family_hints(family_path)
         materialized_mvs = self.store.read_json(mv_state_path)
         historical_rewrites = self._load_historical_rewrites(rewrite_dir)
+        current_query_blocks = self._current_query_blocks(query_blocks["query_blocks"], current_batch)
+        current_query_to_qbs = self._current_query_to_qbs(query_to_qbs, current_batch)
+        current_qb_to_query = self._current_qb_to_query(qb_to_query, current_query_to_qbs)
+        current_query_families = self._current_query_families(
+            families["query_families"],
+            {block["qb_id"] for block in current_query_blocks},
+        )
+        batch_local_candidate_groups = self._batch_local_candidate_groups(current_query_blocks)
 
         input_artifacts = {
             "current_batch": current_batch,
             "historical_rewrites": historical_rewrites,
-            **query_blocks,
-            "query_to_qbs": query_to_qbs,
-            "qb_to_query": qb_to_query,
-            **families,
+            "query_blocks": current_query_blocks,
+            "query_to_qbs": current_query_to_qbs,
+            "qb_to_query": current_qb_to_query,
+            "query_family_hints": current_query_families,
+            "batch_local_candidate_groups": batch_local_candidate_groups,
             "materialized_mvs": materialized_mvs,
             "complexity_batches": complexity_batches["complexity_batches"],
         }
         candidate_output = self._infer_structured(
-            task="基于当前 batch 的 historical rewrite SQL、QueryBlock、QueryFamily 和 materialized_mvs 生成 candidate_mv_output。",
+            task="基于当前 batch 的 historical rewrite SQL、QueryBlock、batch-local candidate groups 和 materialized_mvs 生成 candidate_mv_output。",
             context={"run_id": self.store.run_id, "batch_id": batch_id},
             input_artifacts=input_artifacts,
             output_model=BatchMVOutput,
         )
         output = self._infer_structured(
             task=(
-                "evaluate candidate_mv_output：检查当前 batch 边界、family 边界、shared upstream superset MV、"
+                "evaluate candidate_mv_output：检查当前 batch 边界、QueryBlock 边界、shared upstream superset MV、"
                 "depends_on_mv_ids、build_sql 和 decision；返回修正后的完整 BatchMVOutput。"
             ),
             context={"run_id": self.store.run_id, "batch_id": batch_id},
             input_artifacts={**input_artifacts, "candidate_mv_output": candidate_output},
             output_model=BatchMVOutput,
         )
+        output, scope_normalization_events = self._normalize_output_scope(
+            output=output,
+            current_batch=current_batch,
+            batch_id=batch_id,
+        )
         self._validate_output(
             output,
             current_batch,
-            families["query_families"],
             materialized_mvs,
             batch_id,
             query_blocks["query_blocks"],
@@ -95,7 +108,11 @@ class BatchMVAgent(LLMRulesAgent):
         self.store.append_run_log(
             agent_name=self.agent_name,
             event="success",
-            input_artifact_paths=[batches_path, qb_path, family_path, rewrite_dir, mv_state_path],
+            input_artifact_paths=[
+                path
+                for path in [batches_path, qb_path, family_path, rewrite_dir, mv_state_path]
+                if path is not None
+            ],
             output_artifact_paths=[mv_candidates_path, mv_build_path],
             elapsed_ms=self._elapsed_ms(started_at),
             batch_id=batch_id,
@@ -104,10 +121,18 @@ class BatchMVAgent(LLMRulesAgent):
                 "candidate_count": len(candidate_ids),
                 "candidate_ids": candidate_ids,
                 "family_normalization_events": family_normalization_events,
+                "scope_normalization_events": scope_normalization_events,
             },
         )
         self._append_candidate_logs(output, mv_candidates_path, mv_build_path, batch_id)
         return mv_candidates_path
+
+    def _load_query_family_hints(self, family_path: Path | None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        if family_path is None or not family_path.exists():
+            return {"query_families": []}, []
+        families = self.store.read_json(family_path)
+        families["query_families"], events = normalize_query_families(families.get("query_families", []))
+        return families, events
 
     def _ensure_materialized_mvs(self, materialized_mvs_path: str | Path | None) -> Path:
         path = Path(materialized_mvs_path) if materialized_mvs_path else self.store.path("04_batch_mvs/materialized_mvs.json")
@@ -144,11 +169,200 @@ class BatchMVAgent(LLMRulesAgent):
             raise ValueError(f"No historical rewritten SQL files found in {rewrite_dir}")
         return rewrites
 
+    def _current_query_blocks(self, query_blocks: list[dict[str, Any]], current_batch: dict[str, Any]) -> list[dict[str, Any]]:
+        batch_queries = set(current_batch.get("query_ids", []))
+        return [block for block in query_blocks if block.get("query_id") in batch_queries]
+
+    def _current_query_to_qbs(self, query_to_qbs: dict[str, list[str]], current_batch: dict[str, Any]) -> dict[str, list[str]]:
+        batch_queries = set(current_batch.get("query_ids", []))
+        return {query_id: qb_ids for query_id, qb_ids in query_to_qbs.items() if query_id in batch_queries}
+
+    def _current_qb_to_query(self, qb_to_query: dict[str, str], current_query_to_qbs: dict[str, list[str]]) -> dict[str, str]:
+        current_qb_ids = {qb_id for qb_ids in current_query_to_qbs.values() for qb_id in qb_ids}
+        return {qb_id: query_id for qb_id, query_id in qb_to_query.items() if qb_id in current_qb_ids}
+
+    def _current_query_families(
+        self,
+        query_families: list[dict[str, Any]],
+        current_qb_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        current_families = []
+        for family in query_families:
+            members = [
+                qb_id
+                for qb_id in family.get("members", [])
+                if qb_id in current_qb_ids
+            ]
+            if not members:
+                continue
+            current_families.append(
+                {
+                    **family,
+                    "members": members,
+                }
+            )
+        return current_families
+
+    def _batch_local_candidate_groups(self, query_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        groups: dict[str, dict[str, Any]] = {}
+        for block in query_blocks:
+            if block.get("unsupported_reasons"):
+                continue
+            tables = self._normalized_set(block.get("tables", []))
+            facts = sorted(table for table in tables if table in TPCDS_FACT_TABLES)
+            join_signature = self._normalized_join_edges(block.get("join_edges", []))
+            group_key = "|".join(
+                [
+                    "fact_based" if facts else "dimension_only",
+                    ",".join(facts),
+                    ",".join(tables),
+                    ",".join(join_signature),
+                ]
+            )
+            group = groups.setdefault(
+                group_key,
+                {
+                    "group_key": group_key,
+                    "family_type": "fact_based" if facts else "dimension_only",
+                    "core_fact_table_set": facts,
+                    "table_set": tables,
+                    "join_signature": join_signature,
+                    "query_ids": [],
+                    "qb_ids": [],
+                    "predicate_set": set(),
+                    "group_by_set": set(),
+                    "measure_set": set(),
+                },
+            )
+            group["query_ids"].append(block["query_id"])
+            group["qb_ids"].append(block["qb_id"])
+            group["predicate_set"].update(self._normalized_expressions(block.get("predicates", []), ("predicate_shape", "expr")))
+            group["group_by_set"].update(self._normalized_expressions(block.get("group_by_exprs", []), ("expr",)))
+            group["measure_set"].update(self._normalized_aggregates(block.get("aggregate_exprs", [])))
+
+        output = []
+        for index, group in enumerate(groups.values(), start=1):
+            output.append(
+                {
+                    **group,
+                    "candidate_group_id": f"batch_local_group_{index:04d}",
+                    "query_ids": self._dedupe(group["query_ids"]),
+                    "qb_ids": self._dedupe(group["qb_ids"]),
+                    "predicate_set": sorted(group["predicate_set"]),
+                    "group_by_set": sorted(group["group_by_set"]),
+                    "measure_set": sorted(group["measure_set"]),
+                }
+            )
+        return output
+
+    def _normalized_set(self, values: list[Any]) -> list[str]:
+        return sorted({str(value).strip().lower() for value in values if value is not None and str(value).strip()})
+
+    def _normalized_join_edges(self, values: list[Any]) -> list[str]:
+        return sorted({signature for value in values if (signature := self._join_edge_signature(value))})
+
+    def _normalized_expressions(self, values: list[Any], preferred_keys: tuple[str, ...]) -> list[str]:
+        return sorted({signature for value in values if (signature := self._expression_signature(value, preferred_keys))})
+
+    def _normalized_aggregates(self, values: list[Any]) -> list[str]:
+        return sorted({signature for value in values if (signature := self._aggregate_signature(value))})
+
+    def _join_edge_signature(self, value: Any) -> str:
+        if not isinstance(value, dict):
+            return str(value).strip().lower()
+
+        left = self._column_ref(value.get("left_table"), value.get("left_column"))
+        right = self._column_ref(value.get("right_table"), value.get("right_column"))
+        operator = str(value.get("operator") or "=").strip().lower()
+        if left and right:
+            if operator == "=" and right < left:
+                left, right = right, left
+            return f"{left}{operator}{right}"
+        return self._expression_signature(value, ("expr",))
+
+    def _expression_signature(self, value: Any, preferred_keys: tuple[str, ...]) -> str:
+        if not isinstance(value, dict):
+            return str(value).strip().lower()
+
+        for key in preferred_keys:
+            raw_value = value.get(key)
+            if raw_value is not None and str(raw_value).strip():
+                return str(raw_value).strip().lower()
+
+        columns = value.get("columns") or []
+        if columns:
+            return ",".join(self._normalized_set(columns))
+        return ""
+
+    def _aggregate_signature(self, value: Any) -> str:
+        if not isinstance(value, dict):
+            return str(value).strip().lower()
+
+        agg_func = str(value.get("agg_func") or "").strip().lower()
+        source_ref = self._column_ref(value.get("source_table"), value.get("source_column"))
+        if agg_func and source_ref:
+            return f"{agg_func}({source_ref})"
+        return self._expression_signature(value, ("expr",))
+
+    def _column_ref(self, table: Any, column: Any) -> str:
+        table_name = str(table or "").strip().lower()
+        column_name = str(column or "").strip().lower()
+        if not table_name or not column_name:
+            return ""
+        return f"{table_name}.{column_name}"
+
+    def _dedupe(self, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(values))
+
+    def _normalize_output_scope(
+        self,
+        *,
+        output: dict[str, Any],
+        current_batch: dict[str, Any],
+        batch_id: int,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        batch_queries = set(current_batch.get("query_ids", []))
+        kept_candidates = []
+        events = []
+
+        for candidate in output.get("mv_candidates", []):
+            reason = self._candidate_scope_rejection_reason(
+                candidate=candidate,
+                batch_id=batch_id,
+                batch_queries=batch_queries,
+            )
+            if reason:
+                events.append(
+                    {
+                        "action": "drop_candidate",
+                        "candidate_id": candidate.get("candidate_id"),
+                        "reason": reason,
+                    }
+                )
+                continue
+            kept_candidates.append(candidate)
+
+        return {**output, "mv_candidates": kept_candidates}, events
+
+    def _candidate_scope_rejection_reason(
+        self,
+        *,
+        candidate: dict[str, Any],
+        batch_id: int,
+        batch_queries: set[str],
+    ) -> str | None:
+        if candidate.get("source_batch_id") != batch_id:
+            return "source_batch_id_out_of_scope"
+        if not set(candidate.get("source_query_ids", [])).issubset(batch_queries):
+            return "source_query_ids_out_of_scope"
+        if not set(candidate.get("target_queries", [])).issubset(batch_queries):
+            return "target_queries_out_of_scope"
+        return None
+
     def _validate_output(
         self,
         output: dict[str, Any],
         current_batch: dict[str, Any],
-        query_families: list[dict[str, Any]],
         materialized_mvs: dict[str, Any],
         batch_id: int,
         query_blocks: list[dict[str, Any]],
@@ -158,9 +372,6 @@ class BatchMVAgent(LLMRulesAgent):
             raise ValueError(f"BatchMVOutput batch_id {output['batch_id']} does not match {batch_id}")
 
         batch_queries = set(current_batch.get("query_ids", []))
-        family_ids = {family["family_id"] for family in query_families}
-        family_members = {family["family_id"]: set(family.get("members", [])) for family in query_families}
-        current_batch_family_ids = {group["family_id"] for group in current_batch.get("family_groups", [])}
         available_mv_ids = {
             mv["mv_id"]
             for mv in materialized_mvs.get("materialized_mvs", [])
@@ -187,10 +398,6 @@ class BatchMVAgent(LLMRulesAgent):
 
             if candidate["source_batch_id"] != batch_id:
                 raise ValueError(f"Candidate {candidate_id} source_batch_id must be {batch_id}")
-            if candidate["family_id"] not in family_ids:
-                raise ValueError(f"Candidate {candidate_id} has unknown family_id {candidate['family_id']}")
-            if current_batch_family_ids and candidate["family_id"] not in current_batch_family_ids:
-                raise ValueError(f"Candidate {candidate_id} family_id must belong to current batch family_groups")
             if not candidate["source_query_ids"]:
                 raise ValueError(f"Candidate {candidate_id} source_query_ids cannot be empty")
             if not candidate["target_queries"]:
@@ -204,7 +411,6 @@ class BatchMVAgent(LLMRulesAgent):
                 qb_by_id=qb_by_id,
                 unsupported_qb_ids=unsupported_qb_ids,
                 query_to_qbs=query_to_qbs,
-                family_members=family_members[candidate["family_id"]],
                 require_qb_ids=candidate["decision"] == "materialize",
             )
 
@@ -235,7 +441,6 @@ class BatchMVAgent(LLMRulesAgent):
         qb_by_id: dict[str, dict[str, Any]],
         unsupported_qb_ids: set[str],
         query_to_qbs: dict[str, list[str]],
-        family_members: set[str],
         require_qb_ids: bool,
     ) -> None:
         candidate_id = candidate["candidate_id"]
@@ -254,9 +459,6 @@ class BatchMVAgent(LLMRulesAgent):
             unsupported = [qb_id for qb_id in qb_ids if qb_id in unsupported_qb_ids]
             if unsupported:
                 raise ValueError(f"Candidate {candidate_id} {field_name} contains unsupported QueryBlock {unsupported}")
-            outside_family = [qb_id for qb_id in qb_ids if qb_id not in family_members]
-            if outside_family:
-                raise ValueError(f"Candidate {candidate_id} {field_name} must belong to candidate family: {outside_family}")
             allowed_qbs = {
                 qb_id
                 for query_id in query_ids
