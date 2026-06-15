@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import nbformat
 import pytest
@@ -16,11 +17,13 @@ from llm_demo.src.agents.rewrite_agent import RewriteAgent
 from llm_demo.src.agents.self_iteration_agent import SelfIterationAgent
 from llm_demo.src.agents.sql_loader_agent import SQLLoaderAgent
 from llm_demo.src.core.artifact_store import ArtifactStore
+from llm_demo.src.core.batch_local_candidate_builder import BatchLocalCandidateBuilder
 from llm_demo.src.core.batch_workflow_runner import BatchWorkflowRunner
 from llm_demo.src.core.coverage_summary_builder import CoverageSummaryBuilder
 from llm_demo.src.core.family_candidate_builder import FamilyCandidateBuilder
 from llm_demo.src.core.llm_client import LLMClient
 from llm_demo.src.core.query_analysis_runner import QueryAnalysisRunner
+from llm_demo.src.core.sql_utils import aggregate_measure_column_name
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +43,16 @@ class StaticLLM:
         if not self.responses:
             raise AssertionError("StaticLLM has no remaining responses")
         return json.loads(json.dumps(self.responses.pop(0)))
+
+
+class CapturingLLM(StaticLLM):
+    def __init__(self, responses: list[dict]) -> None:
+        super().__init__(responses)
+        self.prompts: list[str] = []
+
+    def infer(self, prompt: str, load_json: bool = True) -> dict:
+        self.prompts.append(prompt)
+        return super().infer(prompt, load_json=load_json)
 
 
 def make_store(name: str) -> ArtifactStore:
@@ -250,6 +263,17 @@ def rewrite_record(query_id: str, sql: str, status: str = "rewritten") -> dict:
         "semantic_check": {"status": "pass" if status == "rewritten" else "fallback", "reason": "test"},
         "fallback_reason": None if status == "rewritten" else "no_matching_mv",
     }
+
+
+def test_aggregate_measure_column_name_preserves_underscored_function_names() -> None:
+    assert (
+        aggregate_measure_column_name(
+            "stddev_samp(inventory.inv_quantity_on_hand)",
+            "inv_quantity_on_hand",
+        )
+        == "stddev_samp_inv_quantity_on_hand"
+    )
+    assert aggregate_measure_column_name("sum(inventory.inv_quantity_on_hand)", "inv_quantity_on_hand") == "sum_inv_quantity_on_hand"
 
 
 def test_sql_loader_writes_manifest_and_run_log() -> None:
@@ -1217,6 +1241,339 @@ def test_batch_mv_agent_rejects_materialize_candidate_without_column_mappings() 
         )
 
 
+def batch_local_block(
+    qb_id: str,
+    *,
+    query_id: str | None = None,
+    scope_type: str = "outer",
+    tables: list[str] | None = None,
+    join_edges: list[str] | None = None,
+    predicates: list[Any] | None = None,
+    projections: list[Any] | None = None,
+    group_by_exprs: list[Any] | None = None,
+    aggregate_exprs: list[Any] | None = None,
+    unsupported_reasons: list[str] | None = None,
+    extra: dict | None = None,
+) -> dict:
+    block = {
+        "qb_id": qb_id,
+        "query_id": query_id or qb_id.split(".")[0],
+        "scope_type": scope_type,
+        "tables": tables or ["date_dim", "store_sales", "item"],
+        "join_edges": join_edges
+        or [
+            "date_dim.d_date_sk = store_sales.ss_sold_date_sk",
+            "store_sales.ss_item_sk = item.i_item_sk",
+        ],
+        "predicates": predicates or [],
+        "projections": projections or [],
+        "group_by_exprs": group_by_exprs or ["date_dim.d_year"],
+        "aggregate_exprs": aggregate_exprs or ["SUM(store_sales.ss_ext_sales_price)"],
+        "unsupported_reasons": unsupported_reasons or [],
+    }
+    if extra:
+        block.update(extra)
+    return block
+
+
+def test_batch_local_candidate_builder_recalls_pairs_with_jaccard_and_containment() -> None:
+    blocks = [
+        batch_local_block("q42.outer", predicates=["date_dim.d_year = 2000"]),
+        batch_local_block("q52.outer", predicates=["date_dim.d_year = 2000"]),
+        batch_local_block(
+            "q_web.outer",
+            tables=["date_dim", "web_sales", "item"],
+            join_edges=["date_dim.d_date_sk = web_sales.ws_sold_date_sk"],
+            predicates=["date_dim.d_year = 2000"],
+            aggregate_exprs=["SUM(web_sales.ws_ext_sales_price)"],
+        ),
+        batch_local_block(
+            "q_bad.outer",
+            tables=["store_sales"],
+            join_edges=[],
+            predicates=[],
+            group_by_exprs=[],
+            aggregate_exprs=[],
+            unsupported_reasons=["has_window"],
+        ),
+    ]
+
+    artifact = BatchLocalCandidateBuilder().build(batch_id=3, query_blocks=blocks)
+
+    assert artifact["thresholds"]["table_jaccard"] == 0.6
+    assert artifact["thresholds"]["table_containment"] == 0.8
+    assert artifact["thresholds"]["max_qbs_per_group"] == 12
+    assert artifact["thresholds"]["max_query_ids_per_group"] == 8
+    assert artifact["thresholds"]["max_pair_evidence_sent_to_llm"] == 20
+    eligible_pairs = [
+        pair
+        for pair in artifact["pairwise_similarity"]
+        if pair["eligible"]
+    ]
+    assert len(eligible_pairs) == 1
+    assert eligible_pairs[0]["left_qb_id"] == "q42.outer"
+    assert eligible_pairs[0]["right_qb_id"] == "q52.outer"
+    assert eligible_pairs[0]["table_jaccard"] == 1.0
+    assert eligible_pairs[0]["recall_rule"] == "exact_table_set"
+    rejected_reasons = {
+        pair["rejected_reason"]
+        for pair in artifact["pairwise_similarity"]
+        if not pair["eligible"]
+    }
+    assert "no_shared_fact_table" in rejected_reasons
+    assert artifact["rejected_query_blocks"] == [
+        {
+            "qb_id": "q_bad.outer",
+            "query_id": "q_bad",
+            "unsupported_reasons": ["has_window"],
+        }
+    ]
+    candidate_groups = artifact["candidate_groups"]
+    assert [group["candidate_group_id"] for group in candidate_groups] == [
+        "batch_local_group_0001",
+        "batch_local_group_0002",
+    ]
+    assert candidate_groups[0]["group_type"] == "measure_rollup_candidate"
+    assert candidate_groups[0]["qb_ids"] == ["q42.outer", "q52.outer"]
+    assert candidate_groups[0]["common_tables"] == ["date_dim", "item", "store_sales"]
+    assert candidate_groups[0]["measure_key"] == "sum(store_sales.ss_ext_sales_price)"
+    assert candidate_groups[0]["pair_evidence_total_count"] == 1
+    assert candidate_groups[0]["pair_evidence_truncated"] is False
+    assert candidate_groups[0]["top_pair_evidence"][0]["recall_rule"] == "exact_table_set"
+    assert candidate_groups[1]["group_type"] == "single_query_candidate"
+    assert candidate_groups[1]["qb_ids"] == ["q_web.outer"]
+
+
+def test_batch_local_candidate_builder_adds_current_batch_pipeline_reuse_hints() -> None:
+    predicates = [
+        {
+            "expr": "item.i_manager_id = 1",
+            "columns": ["item.i_manager_id"],
+            "predicate_shape": "item.i_manager_id = <CONST>",
+        },
+        {
+            "expr": "date_dim.d_moy = 11",
+            "columns": ["date_dim.d_moy"],
+            "predicate_shape": "date_dim.d_moy = <CONST>",
+        },
+        {
+            "expr": "date_dim.d_year = 2000",
+            "columns": ["date_dim.d_year"],
+            "predicate_shape": "date_dim.d_year = <CONST>",
+        },
+    ]
+    blocks = [
+        batch_local_block(
+            "q42.outer",
+            predicates=predicates,
+            projections=[
+                {"expr": "date_dim.d_year", "columns": ["date_dim.d_year"]},
+                {"expr": "item.i_category_id", "columns": ["item.i_category_id"]},
+                {"expr": "item.i_category", "columns": ["item.i_category"]},
+            ],
+            group_by_exprs=[
+                {"expr": "date_dim.d_year", "columns": ["date_dim.d_year"]},
+                {"expr": "item.i_category_id", "columns": ["item.i_category_id"]},
+                {"expr": "item.i_category", "columns": ["item.i_category"]},
+            ],
+        ),
+        batch_local_block(
+            "q52.outer",
+            predicates=predicates,
+            projections=[
+                {"expr": "date_dim.d_year", "columns": ["date_dim.d_year"]},
+                {"expr": "item.i_brand_id", "columns": ["item.i_brand_id"]},
+                {"expr": "item.i_brand", "columns": ["item.i_brand"]},
+            ],
+            group_by_exprs=[
+                {"expr": "date_dim.d_year", "columns": ["date_dim.d_year"]},
+                {"expr": "item.i_brand_id", "columns": ["item.i_brand_id"]},
+                {"expr": "item.i_brand", "columns": ["item.i_brand"]},
+            ],
+        ),
+    ]
+
+    artifact = BatchLocalCandidateBuilder().build(batch_id=3, query_blocks=blocks)
+
+    hints = artifact["candidate_groups"][0]["pipeline_reuse_hints"]
+    assert hints["online_scope"] == "current_batch_only"
+    assert hints["residual_filter_columns"] == ["date_dim.d_moy", "date_dim.d_year", "item.i_manager_id"]
+    assert hints["residual_filter_predicate_shapes"] == [
+        "date_dim.d_moy = <const>",
+        "date_dim.d_year = <const>",
+        "item.i_manager_id = <const>",
+    ]
+    assert set(hints["projection_columns"]) == {
+        "date_dim.d_year",
+        "item.i_brand",
+        "item.i_brand_id",
+        "item.i_category",
+        "item.i_category_id",
+    }
+    assert set(hints["group_by_columns"]) == {
+        "date_dim.d_year",
+        "item.i_brand",
+        "item.i_brand_id",
+        "item.i_category",
+        "item.i_category_id",
+    }
+    assert set(hints["recommended_fine_grain_group_by_columns"]) == {
+        "date_dim.d_moy",
+        "date_dim.d_year",
+        "item.i_brand",
+        "item.i_brand_id",
+        "item.i_category",
+        "item.i_category_id",
+        "item.i_manager_id",
+    }
+    serialized_hints = json.dumps(hints, ensure_ascii=False).lower()
+    assert "future" not in serialized_hints
+    assert "lookahead" not in serialized_hints
+
+
+def test_batch_local_candidate_builder_uses_complete_linkage_not_transitive_components() -> None:
+    blocks = [
+        batch_local_block("q_wide.outer", query_id="q_wide"),
+        batch_local_block(
+            "q_date.outer",
+            query_id="q_date",
+            tables=["date_dim", "store_sales"],
+            join_edges=["date_dim.d_date_sk = store_sales.ss_sold_date_sk"],
+        ),
+        batch_local_block(
+            "q_item.outer",
+            query_id="q_item",
+            tables=["store_sales", "item"],
+            join_edges=["store_sales.ss_item_sk = item.i_item_sk"],
+            group_by_exprs=["item.i_category"],
+        ),
+    ]
+
+    artifact = BatchLocalCandidateBuilder().build(batch_id=3, query_blocks=blocks)
+
+    eligible_pair_sets = {
+        frozenset((pair["left_qb_id"], pair["right_qb_id"]))
+        for pair in artifact["pairwise_similarity"]
+        if pair["eligible"]
+    }
+    assert eligible_pair_sets == {
+        frozenset(("q_date.outer", "q_wide.outer")),
+        frozenset(("q_item.outer", "q_wide.outer")),
+    }
+    assert all(
+        set(group["qb_ids"]) != {"q_date.outer", "q_item.outer", "q_wide.outer"}
+        for group in artifact["candidate_groups"]
+    )
+    assert {
+        tuple(group["qb_ids"])
+        for group in artifact["candidate_groups"]
+        if group["group_type"] == "superset_anchor_candidate"
+    } == {
+        ("q_date.outer", "q_wide.outer"),
+        ("q_item.outer", "q_wide.outer"),
+    }
+
+
+def test_batch_local_candidate_builder_does_not_let_exact_group_suppress_anchor_recall() -> None:
+    blocks = [
+        batch_local_block("q_wide1.outer", query_id="q_wide1"),
+        batch_local_block("q_wide2.outer", query_id="q_wide2"),
+        batch_local_block(
+            "q_date.outer",
+            query_id="q_date",
+            tables=["date_dim", "store_sales"],
+            join_edges=["date_dim.d_date_sk = store_sales.ss_sold_date_sk"],
+        ),
+    ]
+
+    artifact = BatchLocalCandidateBuilder().build(batch_id=3, query_blocks=blocks)
+
+    assert {
+        tuple(group["qb_ids"])
+        for group in artifact["candidate_groups"]
+        if group["group_type"] == "measure_rollup_candidate"
+    } == {("q_wide1.outer", "q_wide2.outer")}
+    assert {
+        tuple(group["qb_ids"])
+        for group in artifact["candidate_groups"]
+        if group["group_type"] == "superset_anchor_candidate"
+    } == {
+        ("q_date.outer", "q_wide1.outer"),
+        ("q_date.outer", "q_wide2.outer"),
+    }
+
+
+def test_batch_local_candidate_builder_keeps_scope_classes_separate() -> None:
+    blocks = [
+        batch_local_block("q_outer.outer", query_id="q_outer", scope_type="outer"),
+        batch_local_block("q_sub.subquery", query_id="q_sub", scope_type="subquery"),
+        batch_local_block("q_cte.cte.base", query_id="q_cte", scope_type="cte"),
+    ]
+
+    artifact = BatchLocalCandidateBuilder().build(batch_id=3, query_blocks=blocks)
+
+    assert len([pair for pair in artifact["pairwise_similarity"] if pair["eligible"]]) == 3
+    assert all(len(group["qb_ids"]) == 1 for group in artifact["candidate_groups"])
+    assert {group["scope_class"] for group in artifact["candidate_groups"]} == {"outer", "subquery", "cte"}
+
+
+def test_batch_local_candidate_builder_keeps_measure_keys_separate() -> None:
+    blocks = [
+        batch_local_block("q_sum.outer", query_id="q_sum"),
+        batch_local_block("q_avg.outer", query_id="q_avg", aggregate_exprs=["AVG(store_sales.ss_ext_sales_price)"]),
+        batch_local_block("q_count.outer", query_id="q_count", aggregate_exprs=["COUNT(*)"]),
+        batch_local_block("q_window.outer", query_id="q_window", extra={"window_exprs": ["rank() over (...)"]}),
+    ]
+
+    artifact = BatchLocalCandidateBuilder().build(batch_id=3, query_blocks=blocks)
+
+    assert len([pair for pair in artifact["pairwise_similarity"] if pair["eligible"]]) == 6
+    assert all(len(group["qb_ids"]) == 1 for group in artifact["candidate_groups"])
+    assert {
+        group["measure_key"]
+        for group in artifact["candidate_groups"]
+    } == {
+        "sum(store_sales.ss_ext_sales_price)",
+        "avg(store_sales.ss_ext_sales_price)",
+        "count(*)",
+        "window_or_complex",
+    }
+
+
+def test_batch_local_candidate_builder_splits_oversized_groups_by_context_cap() -> None:
+    blocks = [
+        batch_local_block(f"q{index}.outer", query_id=f"q{index}")
+        for index in range(1, 14)
+    ]
+
+    artifact = BatchLocalCandidateBuilder(max_qbs_per_group=12, max_query_ids_per_group=8).build(
+        batch_id=3,
+        query_blocks=blocks,
+    )
+
+    assert len([pair for pair in artifact["pairwise_similarity"] if pair["eligible"]]) == 78
+    assert len(artifact["candidate_groups"]) == 2
+    assert all(group["split_reason"] == "context_cap" for group in artifact["candidate_groups"])
+    assert all(len(group["qb_ids"]) <= 12 for group in artifact["candidate_groups"])
+    assert all(len(group["query_ids"]) <= 8 for group in artifact["candidate_groups"])
+
+
+def test_batch_local_candidate_builder_keeps_full_pairwise_but_sends_top_evidence() -> None:
+    blocks = [
+        batch_local_block(f"q{index}.outer", query_id=f"q{index}")
+        for index in range(1, 7)
+    ]
+
+    artifact = BatchLocalCandidateBuilder(max_pair_evidence_sent_to_llm=3).build(batch_id=3, query_blocks=blocks)
+
+    assert len([pair for pair in artifact["pairwise_similarity"] if pair["eligible"]]) == 15
+    group = artifact["candidate_groups"][0]
+    assert group["pair_evidence_total_count"] == 15
+    assert len(group["top_pair_evidence"]) == 3
+    assert group["pair_evidence"] == group["top_pair_evidence"]
+    assert group["pair_evidence_truncated"] is True
+
+
 def test_batch_mv_agent_rejects_dotted_mv_output_columns() -> None:
     store = make_store("test_batch_mv_dotted_columns")
     batches_path, query_blocks_path, families_path, historical_rewrite_dir = write_minimal_batch_mv_inputs(store, ["q42"])
@@ -1369,28 +1726,141 @@ def test_batch_mv_agent_rejects_measure_alias_without_source_column_prefix() -> 
         )
 
 
-def test_batch_mv_agent_rejects_unsupported_source_query_block() -> None:
+def test_batch_mv_agent_records_unsupported_query_blocks_without_llm_call() -> None:
     store = make_store("test_batch_mv_unsupported_qb")
     batches_path, query_blocks_path, families_path, historical_rewrite_dir = write_minimal_batch_mv_inputs(store, ["q42"])
     query_blocks = store.read_json(query_blocks_path)
     query_blocks["query_blocks"][0]["unsupported_reasons"] = ["has_correlated_subquery"]
     store.write_json("01_query_blocks/query_blocks.json", query_blocks)
+    llm = StaticLLM([])
+
+    mv_candidates_path = BatchMVAgent(store, llm).run(
+        3,
+        batches_path,
+        query_blocks_path,
+        families_path,
+        historical_rewrite_dir,
+    )
+
+    assert llm.calls == 0
+    assert store.read_json(mv_candidates_path) == {"batch_id": 3, "mv_candidates": []}
+    local_candidates = store.read_json(store.path("04_batch_mvs/batch_3_local_candidates.json"))
+    assert local_candidates["candidate_groups"] == []
+    assert local_candidates["rejected_query_blocks"] == [
+        {
+            "qb_id": "q42.outer",
+            "query_id": "q42",
+            "unsupported_reasons": ["has_correlated_subquery"],
+        }
+    ]
+
+
+def test_batch_mv_agent_normalizes_null_qb_lists_for_skip_candidate() -> None:
+    store = make_store("test_batch_mv_null_qb_skip")
+    batches_path, query_blocks_path, families_path, historical_rewrite_dir = write_minimal_batch_mv_inputs(store, ["q42"])
     output = {
         "batch_id": 3,
         "mv_candidates": [
             {
-                "candidate_id": "cand_unsupported_qb",
+                "candidate_id": "cand_skip_null_qbs",
                 "source_batch_id": 3,
                 "source_query_ids": ["q42"],
-                "source_qb_ids": ["q42.outer"],
-                "family_id": "family_fact_ss_dd_item_manager_moy_year",
+                "source_qb_ids": None,
+                "candidate_group_id": "batch_local_group_0001",
                 "target_queries": ["q42"],
-                "target_qb_ids": ["q42.outer"],
+                "target_qb_ids": None,
+                "decision": "skip",
+                "reason": "not_worth_materializing",
+            }
+        ],
+    }
+
+    mv_candidates_path = BatchMVAgent(store, StaticLLM([output, output])).run(
+        3,
+        batches_path,
+        query_blocks_path,
+        families_path,
+        historical_rewrite_dir,
+    )
+
+    candidate = store.read_json(mv_candidates_path)["mv_candidates"][0]
+    assert candidate["source_qb_ids"] == []
+    assert candidate["target_qb_ids"] == []
+    assert candidate["decision"] == "skip"
+
+
+def test_batch_mv_agent_sends_pipeline_reuse_hints_for_current_batch_only_groups() -> None:
+    store = make_store("test_batch_mv_pipeline_hints")
+    batches_path, query_blocks_path, families_path, historical_rewrite_dir = write_minimal_batch_mv_inputs(store, ["q42"])
+    query_blocks = store.read_json(query_blocks_path)
+    query_blocks["query_blocks"].append(
+        {
+            **query_blocks["query_blocks"][0],
+            "qb_id": "q52.outer",
+            "query_id": "q52",
+        }
+    )
+    store.write_json("01_query_blocks/query_blocks.json", query_blocks)
+    query_to_qbs = store.read_json(query_blocks_path.parent / "query_to_qbs.json")
+    query_to_qbs["q52"] = ["q52.outer"]
+    store.write_json("01_query_blocks/query_to_qbs.json", query_to_qbs)
+    qb_to_query = store.read_json(query_blocks_path.parent / "qb_to_query.json")
+    qb_to_query["q52.outer"] = "q52"
+    store.write_json("01_query_blocks/qb_to_query.json", qb_to_query)
+    output = {
+        "batch_id": 3,
+        "mv_candidates": [
+            {
+                "candidate_id": "cand_skip_pipeline_hints",
+                "source_batch_id": 3,
+                "source_query_ids": ["q42"],
+                "source_qb_ids": [],
+                "candidate_group_id": "batch_local_group_0001",
+                "target_queries": ["q42"],
+                "target_qb_ids": [],
+                "decision": "skip",
+                "reason": "not_worth_materializing",
+            }
+        ],
+    }
+    llm = CapturingLLM([output, output])
+
+    BatchMVAgent(store, llm).run(
+        3,
+        batches_path,
+        query_blocks_path,
+        families_path,
+        historical_rewrite_dir,
+    )
+
+    assert llm.calls == 2
+    assert any('"pipeline_reuse_hints"' in prompt for prompt in llm.prompts)
+    assert any('"online_scope": "current_batch_only"' in prompt for prompt in llm.prompts)
+    local_candidates = store.read_json(store.path("04_batch_mvs/batch_3_local_candidates.json"))
+    inventory_query_ids = {record["query_id"] for record in local_candidates["query_block_inventory"]}
+    assert inventory_query_ids == {"q42"}
+    assert local_candidates["candidate_groups"][0]["query_ids"] == ["q42"]
+
+
+def test_batch_mv_agent_still_rejects_materialize_candidate_with_null_qb_lists() -> None:
+    store = make_store("test_batch_mv_null_qb_materialize")
+    batches_path, query_blocks_path, families_path, historical_rewrite_dir = write_minimal_batch_mv_inputs(store, ["q42"])
+    output = {
+        "batch_id": 3,
+        "mv_candidates": [
+            {
+                "candidate_id": "cand_materialize_null_qbs",
+                "source_batch_id": 3,
+                "source_query_ids": ["q42"],
+                "source_qb_ids": None,
+                "candidate_group_id": "batch_local_group_0001",
+                "target_queries": ["q42"],
+                "target_qb_ids": None,
                 "decision": "materialize",
                 "reason": "test",
-                "mv_id": "mv_unsupported_qb",
+                "mv_id": "mv_null_qbs",
                 "mv_type": "fine_grain_aggregate",
-                "target_table_name": "mv_unsupported_qb",
+                "target_table_name": "mv_null_qbs",
                 "depends_on_mv_ids": [],
                 "output_columns": ["d_year"],
                 "column_mappings": [
@@ -1404,12 +1874,12 @@ def test_batch_mv_agent_rejects_unsupported_source_query_block() -> None:
                 ],
                 "group_by_exprs": ["date_dim.d_year"],
                 "measure_exprs": [],
-                "build_sql": "CREATE TABLE mv_unsupported_qb AS SELECT date_dim.d_year FROM date_dim",
+                "build_sql": "CREATE TABLE mv_null_qbs AS SELECT date_dim.d_year FROM date_dim",
             }
         ],
     }
 
-    with pytest.raises(ValueError, match="unsupported QueryBlock"):
+    with pytest.raises(ValueError, match="requires source_qb_ids and target_qb_ids"):
         BatchMVAgent(store, StaticLLM([output, output])).run(
             3,
             batches_path,
@@ -1417,6 +1887,46 @@ def test_batch_mv_agent_rejects_unsupported_source_query_block() -> None:
             families_path,
             historical_rewrite_dir,
         )
+
+
+def test_batch_mv_agent_drops_candidate_qbs_outside_current_candidate_group() -> None:
+    store = make_store("test_batch_mv_candidate_group_scope")
+    batches_path, query_blocks_path, families_path, historical_rewrite_dir = write_minimal_batch_mv_inputs(store, ["q42"])
+    output = {
+        "batch_id": 3,
+        "mv_candidates": [
+            {
+                "candidate_id": "cand_outside_group_qb",
+                "source_batch_id": 3,
+                "source_query_ids": ["q42"],
+                "source_qb_ids": ["q52.outer"],
+                "candidate_group_id": "batch_local_group_0001",
+                "target_queries": ["q42"],
+                "target_qb_ids": ["q52.outer"],
+                "decision": "skip",
+                "reason": "outside_group",
+            }
+        ],
+    }
+
+    mv_candidates_path = BatchMVAgent(store, StaticLLM([output, output])).run(
+        3,
+        batches_path,
+        query_blocks_path,
+        families_path,
+        historical_rewrite_dir,
+    )
+
+    assert store.read_json(mv_candidates_path) == {"batch_id": 3, "mv_candidates": []}
+    records = [json.loads(line) for line in store.run_log_path.read_text(encoding="utf-8").splitlines()]
+    batch_mv_record = next(record for record in records if record["agent_name"] == "BatchMVAgent")
+    assert batch_mv_record["details"]["scope_normalization_events"] == [
+        {
+            "action": "drop_candidate",
+            "candidate_id": "cand_outside_group_qb",
+            "reason": "source_qb_ids_outside_candidate_group",
+        }
+    ]
 
 
 def test_batch_mv_agent_rejects_mv_dependency_cycle() -> None:
@@ -1561,9 +2071,14 @@ def test_batch_mv_agent_accepts_batch_local_candidate_without_family_groups() ->
     assert [candidate["candidate_id"] for candidate in candidates] == ["cand_batch_6_item_q41_0001"]
     assert candidates[0]["family_id"] is None
     assert candidates[0]["candidate_group_id"] == "batch_local_group_0001"
+    local_candidates = store.read_json(store.path("04_batch_mvs/batch_6_local_candidates.json"))
+    assert local_candidates["candidate_groups"][0]["candidate_group_id"] == "batch_local_group_0001"
+    assert local_candidates["candidate_groups"][0]["group_type"] == "single_query_candidate"
     assert "CREATE TABLE mv_item_q41" in store.read_text(store.path("04_batch_mvs/batch_6_mv_build.sql"))
     records = [json.loads(line) for line in store.run_log_path.read_text(encoding="utf-8").splitlines()]
     batch_mv_record = next(record for record in records if record["agent_name"] == "BatchMVAgent")
+    assert batch_mv_record["details"]["candidate_group_count"] == 1
+    assert batch_mv_record["details"]["pairwise_similarity_count"] == 0
     assert batch_mv_record["details"]["scope_normalization_events"] == []
 
 
@@ -1637,6 +2152,71 @@ def test_rewrite_agent_scopes_output_to_current_batch_and_fills_missing_query() 
     assert (rewrite_dir / "q42_rewritten.sql").read_text(encoding="utf-8") == (PROJECT_ROOT / "tpcds-spark" / "q42.sql").read_text(
         encoding="utf-8"
     )
+
+
+def test_rewrite_agent_splits_multi_query_batch_into_query_chunks() -> None:
+    store = make_store("test_rewrite_query_chunks")
+    query_ids = ["q42", "q52"]
+    sql_manifest_path = SQLLoaderAgent(store).run([PROJECT_ROOT / "tpcds-spark" / f"{query_id}.sql" for query_id in query_ids])
+    batches_path = write_minimal_complexity_batches(store, 3, "join_filter_groupby", query_ids)
+    query_blocks_path = store.write_json(
+        "01_query_blocks/query_blocks.json",
+        {
+            "query_blocks": [
+                {"qb_id": "q42.outer", "query_id": "q42", "unsupported_reasons": []},
+                {"qb_id": "q52.outer", "query_id": "q52", "unsupported_reasons": []},
+            ]
+        },
+    )
+    mv_state_path = mv_rewrite_state(store)
+
+    def fallback_record(query_id: str) -> dict:
+        record = rewrite_record(
+            query_id,
+            (PROJECT_ROOT / "tpcds-spark" / f"{query_id}.sql").read_text(encoding="utf-8"),
+            status="fallback",
+        )
+        record["fallback_reason"] = "no_matching_mv"
+        record["semantic_check"] = {"status": "fallback", "reason": "test fallback"}
+        return record
+
+    llm = CapturingLLM(
+        [
+            {"rewrites": [fallback_record("q42")]},
+            {"rewrites": [fallback_record("q42")]},
+            {"rewrites": [fallback_record("q52")]},
+            {"rewrites": [fallback_record("q52")]},
+        ]
+    )
+
+    rewrite_dir = RewriteAgent(store, llm).run(
+        3,
+        "final",
+        batches_path,
+        sql_manifest_path,
+        query_blocks_path,
+        mv_state_path,
+    )
+
+    assert llm.calls == 4
+    assert len(llm.prompts) == 4
+    for query_id in query_ids:
+        assert (rewrite_dir / f"{query_id}_rewrite_meta.json").exists()
+        chunk_dir = store.path(f"05_rewritten_sql/batch_3/final_rewrite_chunks/{query_id}")
+        assert (chunk_dir / "input_artifacts.json").exists()
+        assert (chunk_dir / "candidate_output.json").exists()
+        assert (chunk_dir / "evaluated_output.json").exists()
+        chunk_input = store.read_json(chunk_dir / "input_artifacts.json")
+        assert chunk_input["input_artifacts"]["current_batch"]["query_ids"] == [query_id]
+        assert [query["query_id"] for query in chunk_input["input_artifacts"]["queries"]] == [query_id]
+        assert [block["query_id"] for block in chunk_input["input_artifacts"]["query_blocks"]] == [query_id]
+
+    chunk_plan = store.read_json(store.path("05_rewritten_sql/batch_3/final_rewrite_chunks/chunk_plan.json"))
+    assert chunk_plan["chunking"] == "per_query"
+    assert chunk_plan["query_ids"] == query_ids
+    run_records = [json.loads(line) for line in store.run_log_path.read_text(encoding="utf-8").splitlines()]
+    rewrite_success = [record for record in run_records if record["agent_name"] == "RewriteAgent" and record["event"] == "success"][-1]
+    assert rewrite_success["details"]["rewrite_chunk_count"] == 2
 
 
 def test_rewrite_agent_falls_back_when_original_output_aliases_are_missing() -> None:
@@ -1864,7 +2444,7 @@ def test_live_batch_cluster_batch_mv_and_self_iteration_agents_produce_artifacts
 
     for candidate in mv_output["mv_candidates"]:
         assert candidate["source_batch_id"] == 1
-        assert candidate["family_id"]
+        assert candidate.get("family_id") or candidate.get("candidate_group_id")
         assert set(candidate["source_query_ids"]).issubset(set(target_batch["query_ids"]))
         assert set(candidate["target_queries"]).issubset(set(target_batch["query_ids"]))
         assert not any(query_id.startswith("downstream") for query_id in candidate["target_queries"])

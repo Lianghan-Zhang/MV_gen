@@ -7,11 +7,11 @@ from typing import Any
 
 from llm_demo.src.core.agent_base import LLMRulesAgent
 from llm_demo.src.core.artifact_store import ArtifactStore
-from llm_demo.src.core.family_candidate_builder import TPCDS_FACT_TABLES
+from llm_demo.src.core.batch_local_candidate_builder import BatchLocalCandidateBuilder
 from llm_demo.src.core.family_utils import normalize_query_families
 from llm_demo.src.core.llm_client import LLMClient
 from llm_demo.src.core.physical_schema import load_physical_schema, validate_physical_column
-from llm_demo.src.core.schemas import BatchMVOutput
+from llm_demo.src.core.schemas import BatchMVOutput, model_schema, model_to_dict, validate_model
 from llm_demo.src.core.sql_utils import (
     assert_create_table_as_select,
     aggregate_measure_column_name,
@@ -57,39 +57,93 @@ class BatchMVAgent(LLMRulesAgent):
             families["query_families"],
             {block["qb_id"] for block in current_query_blocks},
         )
-        batch_local_candidate_groups = self._batch_local_candidate_groups(current_query_blocks)
-
-        input_artifacts = {
-            "current_batch": current_batch,
-            "historical_rewrites": historical_rewrites,
-            "query_blocks": current_query_blocks,
-            "query_to_qbs": current_query_to_qbs,
-            "qb_to_query": current_qb_to_query,
-            "query_family_hints": current_query_families,
-            "batch_local_candidate_groups": batch_local_candidate_groups,
-            "materialized_mvs": materialized_mvs,
-            "complexity_batches": complexity_batches["complexity_batches"],
-        }
-        candidate_output = self._infer_structured(
-            task="基于当前 batch 的 historical rewrite SQL、QueryBlock、batch-local candidate groups 和 materialized_mvs 生成 candidate_mv_output。",
-            context={"run_id": self.store.run_id, "batch_id": batch_id},
-            input_artifacts=input_artifacts,
-            output_model=BatchMVOutput,
-        )
-        output = self._infer_structured(
-            task=(
-                "evaluate candidate_mv_output：检查当前 batch 边界、QueryBlock 边界、shared upstream superset MV、"
-                "depends_on_mv_ids、build_sql 和 decision；返回修正后的完整 BatchMVOutput。"
-            ),
-            context={"run_id": self.store.run_id, "batch_id": batch_id},
-            input_artifacts={**input_artifacts, "candidate_mv_output": candidate_output},
-            output_model=BatchMVOutput,
-        )
-        output, scope_normalization_events = self._normalize_output_scope(
-            output=output,
-            current_batch=current_batch,
+        batch_local_candidates = BatchLocalCandidateBuilder().build(
             batch_id=batch_id,
+            query_blocks=current_query_blocks,
         )
+        batch_local_candidates_path = self.store.write_json(
+            f"04_batch_mvs/batch_{batch_id}_local_candidates.json",
+            batch_local_candidates,
+        )
+
+        group_outputs = []
+        scope_normalization_events = []
+        candidate_group_details = []
+        for candidate_group in batch_local_candidates["candidate_groups"]:
+            input_artifacts = self._candidate_group_input_artifacts(
+                current_batch=current_batch,
+                candidate_group=candidate_group,
+                historical_rewrites=historical_rewrites,
+                query_blocks=current_query_blocks,
+                query_to_qbs=current_query_to_qbs,
+                qb_to_query=current_qb_to_query,
+                query_family_hints=current_query_families,
+                materialized_mvs=materialized_mvs,
+            )
+            context = {
+                "run_id": self.store.run_id,
+                "batch_id": batch_id,
+                "candidate_group_id": candidate_group["candidate_group_id"],
+            }
+            candidate_output = self._infer_batch_mv_output(
+                task=(
+                    "只基于当前 candidate_group 的 historical rewrite SQL、QueryBlock、batch-local "
+                    "candidate evidence、pipeline_reuse_hints 和当前可见 materialized_mvs 生成 "
+                    "pipeline-oriented candidate_mv_output。不要读取或面向未来 batch。"
+                ),
+                context=context,
+                input_artifacts=input_artifacts,
+            )
+            candidate_output, generate_events = self._normalize_candidate_group_output(
+                output=candidate_output,
+                candidate_group=candidate_group,
+                batch_id=batch_id,
+                stage="generate",
+            )
+            evaluated_output = self._infer_batch_mv_output(
+                task=(
+                    "evaluate 当前 candidate_group 的 candidate_mv_output：检查当前 batch 边界、QueryBlock 边界、"
+                    "pipeline-oriented shared upstream superset MV、depends_on_mv_ids、build_sql 和 decision；"
+                    "返回修正后的完整 BatchMVOutput。不要输出当前 candidate_group 之外的 Query，"
+                    "不要读取或面向未来 batch。"
+                ),
+                context=context,
+                input_artifacts={**input_artifacts, "candidate_mv_output": candidate_output},
+            )
+            evaluated_output, evaluate_events = self._normalize_candidate_group_output(
+                output=evaluated_output,
+                candidate_group=candidate_group,
+                batch_id=batch_id,
+                stage="evaluate",
+            )
+            evaluated_output, group_scope_events = self._normalize_output_scope(
+                output=evaluated_output,
+                current_batch=current_batch,
+                batch_id=batch_id,
+                candidate_group=candidate_group,
+            )
+            scope_normalization_events.extend(generate_events)
+            scope_normalization_events.extend(evaluate_events)
+            scope_normalization_events.extend(group_scope_events)
+            group_outputs.extend(evaluated_output["mv_candidates"])
+            candidate_group_details.append(
+                {
+                    "candidate_group_id": candidate_group["candidate_group_id"],
+                    "group_type": candidate_group["group_type"],
+                    "recall_rule": candidate_group["recall_rule"],
+                    "query_ids": candidate_group["query_ids"],
+                    "qb_ids": candidate_group["qb_ids"],
+                    "candidate_count": len(evaluated_output["mv_candidates"]),
+                    "candidate_ids": [
+                        candidate["candidate_id"]
+                        for candidate in evaluated_output["mv_candidates"]
+                    ],
+                }
+            )
+
+        output = {"batch_id": batch_id, "mv_candidates": group_outputs}
+        output, duplicate_id_events = self._normalize_duplicate_candidate_ids(output)
+        scope_normalization_events.extend(duplicate_id_events)
         self._validate_output(
             output,
             current_batch,
@@ -113,13 +167,17 @@ class BatchMVAgent(LLMRulesAgent):
                 for path in [batches_path, qb_path, family_path, rewrite_dir, mv_state_path]
                 if path is not None
             ],
-            output_artifact_paths=[mv_candidates_path, mv_build_path],
+            output_artifact_paths=[batch_local_candidates_path, mv_candidates_path, mv_build_path],
             elapsed_ms=self._elapsed_ms(started_at),
             batch_id=batch_id,
             details={
-                "llm_stages": ["generate_candidate_mv_output", "evaluate_mv_output"],
+                "llm_stages": ["per_candidate_group_generate", "per_candidate_group_evaluate"],
+                "candidate_group_count": len(batch_local_candidates["candidate_groups"]),
+                "pairwise_similarity_count": len(batch_local_candidates["pairwise_similarity"]),
+                "rejected_query_block_count": len(batch_local_candidates["rejected_query_blocks"]),
                 "candidate_count": len(candidate_ids),
                 "candidate_ids": candidate_ids,
+                "candidate_group_details": candidate_group_details,
                 "family_normalization_events": family_normalization_events,
                 "scope_normalization_events": scope_normalization_events,
             },
@@ -133,6 +191,41 @@ class BatchMVAgent(LLMRulesAgent):
         families = self.store.read_json(family_path)
         families["query_families"], events = normalize_query_families(families.get("query_families", []))
         return families, events
+
+    def _infer_batch_mv_output(
+        self,
+        *,
+        task: str,
+        context: dict[str, Any],
+        input_artifacts: dict[str, Any],
+    ) -> dict[str, Any]:
+        prompt = self._build_prompt(
+            task=task,
+            context=context,
+            input_artifacts=input_artifacts,
+            output_schema=model_schema(BatchMVOutput),
+        )
+        raw_output = self.llm_client.infer(prompt, load_json=True)
+        raw_output = self._normalize_raw_batch_mv_output(raw_output)
+        validated = validate_model(BatchMVOutput, raw_output)
+        return model_to_dict(validated)
+
+    def _normalize_raw_batch_mv_output(self, raw_output: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(raw_output, dict):
+            return raw_output
+        normalized = {**raw_output}
+        candidates = []
+        for candidate in normalized.get("mv_candidates", []):
+            if not isinstance(candidate, dict):
+                candidates.append(candidate)
+                continue
+            normalized_candidate = {**candidate}
+            for field_name in ("source_qb_ids", "target_qb_ids"):
+                if normalized_candidate.get(field_name) is None:
+                    normalized_candidate[field_name] = []
+            candidates.append(normalized_candidate)
+        normalized["mv_candidates"] = candidates
+        return normalized
 
     def _ensure_materialized_mvs(self, materialized_mvs_path: str | Path | None) -> Path:
         path = Path(materialized_mvs_path) if materialized_mvs_path else self.store.path("04_batch_mvs/materialized_mvs.json")
@@ -203,116 +296,125 @@ class BatchMVAgent(LLMRulesAgent):
             )
         return current_families
 
-    def _batch_local_candidate_groups(self, query_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        groups: dict[str, dict[str, Any]] = {}
-        for block in query_blocks:
-            if block.get("unsupported_reasons"):
-                continue
-            tables = self._normalized_set(block.get("tables", []))
-            facts = sorted(table for table in tables if table in TPCDS_FACT_TABLES)
-            join_signature = self._normalized_join_edges(block.get("join_edges", []))
-            group_key = "|".join(
-                [
-                    "fact_based" if facts else "dimension_only",
-                    ",".join(facts),
-                    ",".join(tables),
-                    ",".join(join_signature),
-                ]
-            )
-            group = groups.setdefault(
-                group_key,
-                {
-                    "group_key": group_key,
-                    "family_type": "fact_based" if facts else "dimension_only",
-                    "core_fact_table_set": facts,
-                    "table_set": tables,
-                    "join_signature": join_signature,
-                    "query_ids": [],
-                    "qb_ids": [],
-                    "predicate_set": set(),
-                    "group_by_set": set(),
-                    "measure_set": set(),
-                },
-            )
-            group["query_ids"].append(block["query_id"])
-            group["qb_ids"].append(block["qb_id"])
-            group["predicate_set"].update(self._normalized_expressions(block.get("predicates", []), ("predicate_shape", "expr")))
-            group["group_by_set"].update(self._normalized_expressions(block.get("group_by_exprs", []), ("expr",)))
-            group["measure_set"].update(self._normalized_aggregates(block.get("aggregate_exprs", [])))
+    def _candidate_group_input_artifacts(
+        self,
+        *,
+        current_batch: dict[str, Any],
+        candidate_group: dict[str, Any],
+        historical_rewrites: list[dict[str, Any]],
+        query_blocks: list[dict[str, Any]],
+        query_to_qbs: dict[str, list[str]],
+        qb_to_query: dict[str, str],
+        query_family_hints: list[dict[str, Any]],
+        materialized_mvs: dict[str, Any],
+    ) -> dict[str, Any]:
+        group_query_ids = set(candidate_group["query_ids"])
+        group_qb_ids = set(candidate_group["qb_ids"])
+        group_query_blocks = [block for block in query_blocks if block["qb_id"] in group_qb_ids]
+        group_query_to_qbs = {
+            query_id: [qb_id for qb_id in qb_ids if qb_id in group_qb_ids]
+            for query_id, qb_ids in query_to_qbs.items()
+            if query_id in group_query_ids
+        }
+        group_qb_to_query = {
+            qb_id: query_id
+            for qb_id, query_id in qb_to_query.items()
+            if qb_id in group_qb_ids
+        }
+        return {
+            "current_batch": {
+                **current_batch,
+                "query_ids": candidate_group["query_ids"],
+                "batch_scope_query_ids": current_batch.get("query_ids", []),
+            },
+            "candidate_group": candidate_group,
+            "batch_local_candidate_groups": [candidate_group],
+            "historical_rewrites": [
+                rewrite
+                for rewrite in historical_rewrites
+                if rewrite["query_id"] in group_query_ids
+            ],
+            "query_blocks": group_query_blocks,
+            "query_to_qbs": group_query_to_qbs,
+            "qb_to_query": group_qb_to_query,
+            "query_family_hints": self._candidate_group_family_hints(query_family_hints, group_qb_ids),
+            "materialized_mvs": materialized_mvs,
+        }
 
-        output = []
-        for index, group in enumerate(groups.values(), start=1):
-            output.append(
+    def _candidate_group_family_hints(
+        self,
+        query_family_hints: list[dict[str, Any]],
+        group_qb_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        hints = []
+        for family in query_family_hints:
+            members = [qb_id for qb_id in family.get("members", []) if qb_id in group_qb_ids]
+            if not members:
+                continue
+            hints.append({**family, "members": members})
+        return hints
+
+    def _normalize_candidate_group_output(
+        self,
+        *,
+        output: dict[str, Any],
+        candidate_group: dict[str, Any],
+        batch_id: int,
+        stage: str,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        events = []
+        if output.get("batch_id") != batch_id:
+            events.append(
                 {
-                    **group,
-                    "candidate_group_id": f"batch_local_group_{index:04d}",
-                    "query_ids": self._dedupe(group["query_ids"]),
-                    "qb_ids": self._dedupe(group["qb_ids"]),
-                    "predicate_set": sorted(group["predicate_set"]),
-                    "group_by_set": sorted(group["group_by_set"]),
-                    "measure_set": sorted(group["measure_set"]),
+                    "action": "normalize_batch_id",
+                    "stage": stage,
+                    "candidate_group_id": candidate_group["candidate_group_id"],
+                    "original_batch_id": output.get("batch_id"),
+                    "normalized_batch_id": batch_id,
                 }
             )
-        return output
 
-    def _normalized_set(self, values: list[Any]) -> list[str]:
-        return sorted({str(value).strip().lower() for value in values if value is not None and str(value).strip()})
+        normalized_candidates = []
+        for candidate in output.get("mv_candidates", []):
+            normalized_candidate = {**candidate}
+            if normalized_candidate.get("candidate_group_id") != candidate_group["candidate_group_id"]:
+                events.append(
+                    {
+                        "action": "normalize_candidate_group_id",
+                        "stage": stage,
+                        "candidate_id": normalized_candidate.get("candidate_id"),
+                        "original_candidate_group_id": normalized_candidate.get("candidate_group_id"),
+                        "normalized_candidate_group_id": candidate_group["candidate_group_id"],
+                    }
+                )
+                normalized_candidate["candidate_group_id"] = candidate_group["candidate_group_id"]
+            normalized_candidates.append(normalized_candidate)
+        return {"batch_id": batch_id, "mv_candidates": normalized_candidates}, events
 
-    def _normalized_join_edges(self, values: list[Any]) -> list[str]:
-        return sorted({signature for value in values if (signature := self._join_edge_signature(value))})
-
-    def _normalized_expressions(self, values: list[Any], preferred_keys: tuple[str, ...]) -> list[str]:
-        return sorted({signature for value in values if (signature := self._expression_signature(value, preferred_keys))})
-
-    def _normalized_aggregates(self, values: list[Any]) -> list[str]:
-        return sorted({signature for value in values if (signature := self._aggregate_signature(value))})
-
-    def _join_edge_signature(self, value: Any) -> str:
-        if not isinstance(value, dict):
-            return str(value).strip().lower()
-
-        left = self._column_ref(value.get("left_table"), value.get("left_column"))
-        right = self._column_ref(value.get("right_table"), value.get("right_column"))
-        operator = str(value.get("operator") or "=").strip().lower()
-        if left and right:
-            if operator == "=" and right < left:
-                left, right = right, left
-            return f"{left}{operator}{right}"
-        return self._expression_signature(value, ("expr",))
-
-    def _expression_signature(self, value: Any, preferred_keys: tuple[str, ...]) -> str:
-        if not isinstance(value, dict):
-            return str(value).strip().lower()
-
-        for key in preferred_keys:
-            raw_value = value.get(key)
-            if raw_value is not None and str(raw_value).strip():
-                return str(raw_value).strip().lower()
-
-        columns = value.get("columns") or []
-        if columns:
-            return ",".join(self._normalized_set(columns))
-        return ""
-
-    def _aggregate_signature(self, value: Any) -> str:
-        if not isinstance(value, dict):
-            return str(value).strip().lower()
-
-        agg_func = str(value.get("agg_func") or "").strip().lower()
-        source_ref = self._column_ref(value.get("source_table"), value.get("source_column"))
-        if agg_func and source_ref:
-            return f"{agg_func}({source_ref})"
-        return self._expression_signature(value, ("expr",))
-
-    def _column_ref(self, table: Any, column: Any) -> str:
-        table_name = str(table or "").strip().lower()
-        column_name = str(column or "").strip().lower()
-        if not table_name or not column_name:
-            return ""
-        return f"{table_name}.{column_name}"
-
-    def _dedupe(self, values: list[str]) -> list[str]:
-        return list(dict.fromkeys(values))
+    def _normalize_duplicate_candidate_ids(self, output: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        seen: set[str] = set()
+        events = []
+        normalized_candidates = []
+        for candidate in output["mv_candidates"]:
+            normalized_candidate = {**candidate}
+            candidate_id = normalized_candidate["candidate_id"]
+            if candidate_id in seen:
+                group_suffix = str(normalized_candidate.get("candidate_group_id") or len(seen) + 1)
+                normalized_id = f"{candidate_id}__{group_suffix}"
+                while normalized_id in seen:
+                    normalized_id = f"{normalized_id}_dup"
+                events.append(
+                    {
+                        "action": "rename_duplicate_candidate_id",
+                        "original_candidate_id": candidate_id,
+                        "normalized_candidate_id": normalized_id,
+                    }
+                )
+                normalized_candidate["candidate_id"] = normalized_id
+                candidate_id = normalized_id
+            seen.add(candidate_id)
+            normalized_candidates.append(normalized_candidate)
+        return {"batch_id": output["batch_id"], "mv_candidates": normalized_candidates}, events
 
     def _normalize_output_scope(
         self,
@@ -320,6 +422,7 @@ class BatchMVAgent(LLMRulesAgent):
         output: dict[str, Any],
         current_batch: dict[str, Any],
         batch_id: int,
+        candidate_group: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         batch_queries = set(current_batch.get("query_ids", []))
         kept_candidates = []
@@ -330,6 +433,7 @@ class BatchMVAgent(LLMRulesAgent):
                 candidate=candidate,
                 batch_id=batch_id,
                 batch_queries=batch_queries,
+                candidate_group=candidate_group,
             )
             if reason:
                 events.append(
@@ -350,6 +454,7 @@ class BatchMVAgent(LLMRulesAgent):
         candidate: dict[str, Any],
         batch_id: int,
         batch_queries: set[str],
+        candidate_group: dict[str, Any] | None = None,
     ) -> str | None:
         if candidate.get("source_batch_id") != batch_id:
             return "source_batch_id_out_of_scope"
@@ -357,6 +462,19 @@ class BatchMVAgent(LLMRulesAgent):
             return "source_query_ids_out_of_scope"
         if not set(candidate.get("target_queries", [])).issubset(batch_queries):
             return "target_queries_out_of_scope"
+        if candidate_group is not None:
+            group_queries = set(candidate_group["query_ids"])
+            group_qbs = set(candidate_group["qb_ids"])
+            if not set(candidate.get("source_query_ids", [])).issubset(group_queries):
+                return "source_query_ids_outside_candidate_group"
+            if not set(candidate.get("target_queries", [])).issubset(group_queries):
+                return "target_queries_outside_candidate_group"
+            source_qb_ids = set(candidate.get("source_qb_ids", []))
+            target_qb_ids = set(candidate.get("target_qb_ids", []))
+            if source_qb_ids and not source_qb_ids.issubset(group_qbs):
+                return "source_qb_ids_outside_candidate_group"
+            if target_qb_ids and not target_qb_ids.issubset(group_qbs):
+                return "target_qb_ids_outside_candidate_group"
         return None
 
     def _validate_output(

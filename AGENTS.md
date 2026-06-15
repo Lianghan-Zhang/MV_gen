@@ -63,6 +63,10 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ## 5. Project-Specific Instructions
 
 - working environment: conda mv_gen
+- ETL pipeline workflow: batch classification is SQL-level and batch order is execution order.
+- Online batch constraint: current batch code and agents must not read future batch SQL, QueryBlock, or rewrite outputs.
+- `materialized_mvs.json` is the global incremental MV pool. Batch-k historical rewrite may only use MVs visible after Batch-(k-1); Batch-k generated MVs expand the pool for Batch-k final rewrite and later batches.
+- BatchMVAgent should generate pipeline-oriented MVs by default, not narrow caches that only serve the current SQL.
 
 ## Agent skills
 

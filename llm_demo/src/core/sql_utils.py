@@ -67,7 +67,8 @@ def aggregate_measure_column_name(source_expr: str, source_column: str) -> str:
     expression = _parse_sql(source_expr)
     if not isinstance(expression, exp.AggFunc):
         raise ValueError(f"Measure source_expr must be an aggregate expression: {source_expr}")
-    return f"{expression.key.lower()}_{source_column.lower()}"
+    function_name = expression.sql_name().lower()
+    return f"{function_name}_{source_column.lower()}"
 
 
 def unknown_column_names(sql: str, allowed_columns: set[str]) -> set[str]:

@@ -40,6 +40,107 @@ ValueError: Candidate cand_batch_3_family_catalog_sales_store_returns_store_sale
 
 - `llm_demo/rules/batch_mv_agent.md`
 
+## 2026-06-14：在线 ETL Pipeline MV 只基于当前 batch 生成
+
+### 背景
+
+当前工作流按 SQL 到达顺序分 batch：Batch-k 先使用 Batch-(k-1) 结束后已经存在的全局 MV 池做 historical rewrite，再基于当前 batch 的 historical rewrite SQL、QueryBlock 和当前 MV 池生成新的 MV，扩充 `materialized_mvs.json`，最后完成本 batch final rewrite。当前 batch 不应读取后续 batch 的 SQL、QueryBlock 或 rewrite 结果。
+
+此前讨论过 `current_local_mv` / `pool_reusable_mv` 的二分法，但这会偏离当前 pipeline 设计：本项目的 MV 池本来就是全局增量维护的，MV 是否被后续 batch 使用应通过后续自然到达的 rewrite 命中来体现，而不是在生成阶段读取未来信息。
+
+### 临时决策
+
+当前阶段统一采用 pipeline-oriented MV 策略，不拆分 `current_local_mv` 和 `pool_reusable_mv` 两类 MV。
+
+BatchMVAgent 生成的 Candidate 必须来自当前 batch 的 QueryBlock；不能为了未来 batch 生成没有当前 batch 依据的 MV，也不能读取或推断未来 batch。
+
+为了提高后续 batch 的自然复用概率，当前 batch 的常量型过滤默认优先作为 `residual_filters` 记录，而不是自动固化进 `mv_predicates`。对应 MV 需要保留 residual filter、projection 和 roll-up 所需列或 group-by 粒度。
+
+`BatchLocalCandidateBuilder` 在每个 candidate group 中增加 `pipeline_reuse_hints`，只从当前 batch QueryBlock 的结构化字段确定性计算 residual filter 列、projection 列、group-by 列和推荐细粒度 group-by 列；该提示只作为 LLM 生成 pipeline-oriented MV 的输入，不改变 materialize validator 的严格校验。
+
+### 后续统一修改方向
+
+- 根据后续 dry-run 结果评估 RewriteAgent 是否需要更强的 residual filter / roll-up 匹配能力。
+- 如果 AVG、ratio、CASE 等派生 measure 需要进入 pipeline MV，再单独设计 sum/count 或表达式 lineage schema。
+- 如果需要控制 MV 过宽风险，再增加可量化的列数、group-by 粒度或存储成本约束。
+
+### 临时触达文件
+
+- `AGENTS.md`
+- `llm_demo/src/core/batch_local_candidate_builder.py`
+- `llm_demo/rules/batch_mv_agent.md`
+
+## 2026-06-13：BatchMVAgent 先用确定性候选召回，再按候选组调用 LLM
+
+### 背景
+
+在取消 QueryFamily 作为 BatchMVAgent 硬边界后，完整 dry-run 可以跑通，但 final rewrite 仍然大量 fallback。已成功运行的摘要显示 materialized MV 数量增加有限，而绝大多数 fallback 仍是 `no_matching_mv`。这说明当前 MV 生成阶段仍然缺少稳定的候选枚举机制：LLM 一次接收整个 batch 的 QueryBlock、historical rewrite 和规则上下文，容易遗漏有物化潜力的公共计算结构。
+
+用户提出用同一 batch 内 SQL 涉及表集合的 Jaccard Similarity 做两两比对，用于筛选适合提取公共计算结构的候选。讨论后确认：不能引入没有核心论据支撑的加权综合分；Jaccard / Containment 应只作为 deterministic recall，不直接决定是否 materialize。
+
+### 临时决策
+
+当前阶段，`BatchMVAgent` 采用“确定性候选召回 + 小上下文 LLM 判断”：
+
+- 新增 batch-local candidate builder，对当前 batch 内 supported QueryBlock 做两两表集合 Jaccard / Containment 比对。
+- Jaccard / Containment 只负责召回候选；超过阈值不等于必须物化。
+- 使用 `MVCompatibilityKey = (scope_class, family_type, core_fact_table_set, measure_key)` 做硬分桶，排除明显不应合并的结构，例如 outer / cte / subquery 不混合、fact_based / dimension_only 不混合、core fact table set 不一致不混合、measure key 不一致不混合。
+- 完整 pairwise similarity 落盘保存，但 LLM 输入不按每个 pair 调用，也不再按 eligible pair 图的连通分量合并。当前改为在每个 compatibility bucket 内生成小而明确的 candidate group，包括 `exact_shape_candidate`、`superset_anchor_candidate`、`measure_rollup_candidate`、`dimension_filter_candidate`。
+- candidate group 使用 complete-linkage：新成员必须与组内所有成员兼容，禁止 A-B、B-C eligible 但 A-C 不兼容时形成传递膨胀的大组。
+- candidate group 设置上下文上限：默认 `max_qbs_per_group = 12`、`max_query_ids_per_group = 8`、`max_pair_evidence_sent_to_llm = 20`。超限时按 `table_set -> join_signature -> measure_key -> group_by_set -> predicate_shape_set` 稳定拆分，仍超限则稳定 chunk，并记录 `split_reason = "context_cap"`。
+- 传给 LLM 的 candidate group 只保留 compact summary 和 top pair evidence；完整 pairwise evidence 只保留在落盘 artifact 中。
+- 每个 `candidate_group` 单独传给 BatchMVAgent 的 LLM generate / evaluate，不再把整个 batch 的所有 QueryBlock 一次性交给 LLM 判断。
+- `batch_{batch_id}_local_candidates.json` 落盘保存 QueryBlock inventory、pairwise similarity、candidate groups 和 rejected QueryBlock，方便后续检查候选召回覆盖。
+- `candidate_group_id` 成为追踪 batch-local 候选来源的主要字段；`family_id` 仍然只是可选 hint。
+
+### 后续统一修改方向
+
+- 根据新 run 的 `batch_*_local_candidates.json` 和 final rewrite meta，检查是 candidate recall 不足、LLM materialize 判断不足，还是 RewriteAgent 匹配不足。
+- 如果候选组数量过多或过少，优先检查 compatibility key、complete-linkage 和 context cap 的召回 / 拆分效果；不要重新引入无依据的综合权重。
+- 后续如果要改成 cluster，需要给出可量化、可溯源的兼容标准，不能退回到单纯连通分量。
+
+### 临时触达文件
+
+- `llm_demo/src/core/batch_local_candidate_builder.py`
+- `llm_demo/src/agents/batch_mv_agent.py`
+- `llm_demo/rules/batch_mv_agent.md`
+- `llm_demo/notebooks/etl_agent_flow_resume_prefail_artifacts.ipynb`
+
+## 2026-06-13：BatchMVAgent 结构化输出中 qb id list 的最小容错
+
+### 背景
+
+当前 per-candidate-group 调用中，LLM 偶尔会在 skip Candidate 中输出：
+
+```json
+{
+  "source_qb_ids": null,
+  "target_qb_ids": null
+}
+```
+
+这会在进入 Python scope normalization 和严格 validator 之前，先被 Pydantic 拒绝，导致本应可修正为 skip 的输出直接中断运行。
+
+### 临时决策
+
+当前阶段允许 `BatchMVAgent` 在结构化输出入口做最小输入容错：
+
+- 仅对 `mv_candidates[].source_qb_ids` 和 `mv_candidates[].target_qb_ids` 生效。
+- 如果 LLM 显式返回 `null`，在 Pydantic 校验前归一化为空数组 `[]`。
+- 该容错只用于 skip Candidate 或后续 scope normalization，不表示 schema 语义变成 nullable。
+- `decision = "materialize"` 仍必须包含非空 `source_qb_ids` 和 `target_qb_ids`，归一化为空数组后仍由 validator 拒绝。
+- 如果 Candidate 输出当前 candidate group 外的 query 或 qb，仍由 scope normalization 丢弃，不因该容错放宽边界。
+
+### 后续统一修改方向
+
+- 在 rules 中继续要求 LLM 输出空数组而不是 `null`。
+- 如果后续类似字段继续出现 `null`，先评估是否是 prompt/schema 表达问题，不要批量放宽 schema。
+
+### 临时触达文件
+
+- `llm_demo/src/agents/batch_mv_agent.py`
+- `llm_demo/rules/batch_mv_agent.md`
+
 ## 2026-06-12：暂时不为没有 QueryFamily 的 batch 发明 family_id
 
 > 2026-06-13 更新：本节是旧短期策略，已被“取消 QueryFamily 作为 BatchMVAgent 的硬边界”覆盖。保留本节用于记录决策演进。

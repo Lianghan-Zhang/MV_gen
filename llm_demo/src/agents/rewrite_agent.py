@@ -53,51 +53,14 @@ class RewriteAgent(LLMRulesAgent):
             current_batch.get("query_ids", []),
         )
 
-        input_artifacts = {
-            "rewrite_stage": rewrite_stage,
-            "current_batch": current_batch,
-            "queries": queries,
-            "query_blocks": current_query_blocks,
-            "materialized_mvs": materialized_mvs,
-        }
-        candidate_output = self._infer_structured(
-            task="基于当前 batch 的 original SQL、QueryBlock 和 materialized_mvs 生成 candidate rewrite 输出。",
-            context={"run_id": self.store.run_id, "batch_id": batch_id, "rewrite_stage": rewrite_stage},
-            input_artifacts=input_artifacts,
-            output_model=RewriteOutput,
-        )
-        output = self._infer_structured(
-            task=(
-                "evaluate candidate rewrite 输出：检查 query_id、rewrite_stage、used_mv_ids、fallback_reason "
-                "和语义等价说明；final rewrite 必须保留 original SQL 的 ORDER BY 和 LIMIT；返回修正后的完整 RewriteOutput。"
-            ),
-            context={"run_id": self.store.run_id, "batch_id": batch_id, "rewrite_stage": rewrite_stage},
-            input_artifacts={**input_artifacts, "candidate_rewrite_output": candidate_output},
-            output_model=RewriteOutput,
-        )
-        output, normalization_events = self._normalize_output_scope(
-            output=output,
+        output, normalization_events, chunk_artifact_paths = self._infer_rewrite_chunks(
+            batch_id=batch_id,
+            rewrite_stage=rewrite_stage,
             current_batch=current_batch,
             queries=queries,
-            rewrite_stage=rewrite_stage,
-            batch_id=batch_id,
+            current_query_blocks=current_query_blocks,
+            materialized_mvs=materialized_mvs,
         )
-        if rewrite_stage == "final":
-            output = self._repair_final_order_limit(
-                output=output,
-                input_artifacts=input_artifacts,
-                materialized_mvs=materialized_mvs,
-                queries=queries,
-                batch_id=batch_id,
-            )
-            output, repair_normalization_events = self._normalize_output_scope(
-                output=output,
-                current_batch=current_batch,
-                queries=queries,
-                rewrite_stage=rewrite_stage,
-                batch_id=batch_id,
-            )
-            normalization_events.extend(repair_normalization_events)
         output = self._apply_safety_fallbacks(output, materialized_mvs, queries, rewrite_stage)
         self._validate_output(output, current_batch, materialized_mvs, query_blocks["query_blocks"], batch_id, rewrite_stage)
 
@@ -117,9 +80,141 @@ class RewriteAgent(LLMRulesAgent):
                 "query_ids": current_batch.get("query_ids", []),
                 "rewrite_statuses": {record["query_id"]: record["status"] for record in output["rewrites"]},
                 "scope_normalization_events": normalization_events,
+                "rewrite_chunk_count": len(current_batch.get("query_ids", [])),
+                "rewrite_chunk_artifact_paths": [str(path) for path in chunk_artifact_paths],
             },
         )
         return rewrite_dir
+
+    def _infer_rewrite_chunks(
+        self,
+        *,
+        batch_id: int,
+        rewrite_stage: str,
+        current_batch: dict[str, Any],
+        queries: list[dict[str, str]],
+        current_query_blocks: list[dict[str, Any]],
+        materialized_mvs: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[Path]]:
+        query_ids = list(current_batch.get("query_ids", []))
+        queries_by_id = {query["query_id"]: query for query in queries}
+        chunk_root_relative = f"05_rewritten_sql/batch_{batch_id}/{rewrite_stage}_rewrite_chunks"
+        chunk_artifact_paths: list[Path] = []
+        chunk_artifact_paths.append(
+            self.store.write_json(
+                f"{chunk_root_relative}/chunk_plan.json",
+                {
+                    "run_id": self.store.run_id,
+                    "batch_id": batch_id,
+                    "rewrite_stage": rewrite_stage,
+                    "chunking": "per_query",
+                    "query_ids": query_ids,
+                    "materialized_mv_count": len(materialized_mvs.get("materialized_mvs", [])),
+                },
+            )
+        )
+
+        combined_rewrites: list[dict[str, Any]] = []
+        normalization_events: list[dict[str, Any]] = []
+        for chunk_index, query_id in enumerate(query_ids, start=1):
+            query = queries_by_id[query_id]
+            chunk_current_batch = self._current_batch_for_query(current_batch, query_id)
+            chunk_queries = [query]
+            chunk_query_blocks = [block for block in current_query_blocks if block.get("query_id") == query_id]
+            input_artifacts = {
+                "rewrite_stage": rewrite_stage,
+                "current_batch": chunk_current_batch,
+                "queries": chunk_queries,
+                "query_blocks": chunk_query_blocks,
+                "materialized_mvs": materialized_mvs,
+            }
+            context = {
+                "run_id": self.store.run_id,
+                "batch_id": batch_id,
+                "rewrite_stage": rewrite_stage,
+                "chunk_index": chunk_index,
+                "chunk_count": len(query_ids),
+                "chunk_query_ids": [query_id],
+            }
+            chunk_relative = f"{chunk_root_relative}/{query_id}"
+            chunk_artifact_paths.append(
+                self.store.write_json(
+                    f"{chunk_relative}/input_artifacts.json",
+                    {
+                        "context": context,
+                        "input_artifacts": input_artifacts,
+                    },
+                )
+            )
+            candidate_output = self._infer_structured(
+                task=(
+                    "基于当前 chunk 的 original SQL、QueryBlock 和 materialized_mvs 生成 candidate rewrite 输出。"
+                    "本次只处理 context.chunk_query_ids 中的 query。"
+                ),
+                context=context,
+                input_artifacts=input_artifacts,
+                output_model=RewriteOutput,
+            )
+            chunk_artifact_paths.append(self.store.write_json(f"{chunk_relative}/candidate_output.json", candidate_output))
+            output = self._infer_structured(
+                task=(
+                    "evaluate candidate rewrite 输出：检查 query_id、rewrite_stage、used_mv_ids、fallback_reason "
+                    "和语义等价说明；final rewrite 必须保留 original SQL 的 ORDER BY 和 LIMIT；"
+                    "返回当前 chunk 的完整 RewriteOutput。"
+                ),
+                context=context,
+                input_artifacts={**input_artifacts, "candidate_rewrite_output": candidate_output},
+                output_model=RewriteOutput,
+            )
+            chunk_artifact_paths.append(self.store.write_json(f"{chunk_relative}/evaluated_output.json", output))
+            output, chunk_events = self._normalize_output_scope(
+                output=output,
+                current_batch=chunk_current_batch,
+                queries=chunk_queries,
+                rewrite_stage=rewrite_stage,
+                batch_id=batch_id,
+            )
+            normalization_events.extend(self._tag_chunk_events(chunk_events, query_id))
+            if rewrite_stage == "final":
+                output = self._repair_final_order_limit(
+                    output=output,
+                    input_artifacts=input_artifacts,
+                    materialized_mvs=materialized_mvs,
+                    queries=chunk_queries,
+                    batch_id=batch_id,
+                    repair_dir_relative=chunk_relative,
+                    chunk_artifact_paths=chunk_artifact_paths,
+                )
+                output, repair_events = self._normalize_output_scope(
+                    output=output,
+                    current_batch=chunk_current_batch,
+                    queries=chunk_queries,
+                    rewrite_stage=rewrite_stage,
+                    batch_id=batch_id,
+                )
+                normalization_events.extend(self._tag_chunk_events(repair_events, query_id))
+            combined_rewrites.extend(output["rewrites"])
+
+        return {"rewrites": combined_rewrites}, normalization_events, chunk_artifact_paths
+
+    def _current_batch_for_query(self, current_batch: dict[str, Any], query_id: str) -> dict[str, Any]:
+        chunk_batch = {**current_batch, "query_ids": [query_id]}
+        family_groups = []
+        for group in current_batch.get("family_groups", []):
+            if query_id not in group.get("query_ids", []):
+                continue
+            family_groups.append(
+                {
+                    **group,
+                    "query_ids": [query_id],
+                    "qb_ids": [qb_id for qb_id in group.get("qb_ids", []) if qb_id.startswith(f"{query_id}.")],
+                }
+            )
+        chunk_batch["family_groups"] = family_groups
+        return chunk_batch
+
+    def _tag_chunk_events(self, events: list[dict[str, Any]], query_id: str) -> list[dict[str, Any]]:
+        return [{**event, "chunk_query_id": query_id} for event in events]
 
     def _ensure_materialized_mvs(self, materialized_mvs_path: str | Path | None) -> Path:
         path = Path(materialized_mvs_path) if materialized_mvs_path else self.store.path("04_batch_mvs/materialized_mvs.json")
@@ -336,6 +431,8 @@ class RewriteAgent(LLMRulesAgent):
         materialized_mvs: dict[str, Any],
         queries: list[dict[str, str]],
         batch_id: int,
+        repair_dir_relative: str | None = None,
+        chunk_artifact_paths: list[Path] | None = None,
     ) -> dict[str, Any]:
         for attempt in range(1, self.FINAL_REWRITE_REPAIR_ATTEMPTS + 1):
             issues = self._final_order_limit_issues(output, materialized_mvs, queries)
@@ -357,6 +454,10 @@ class RewriteAgent(LLMRulesAgent):
                 input_artifacts={**input_artifacts, "previous_rewrite_output": output, "safety_issues": issues},
                 output_model=RewriteOutput,
             )
+            if repair_dir_relative and chunk_artifact_paths is not None:
+                chunk_artifact_paths.append(
+                    self.store.write_json(f"{repair_dir_relative}/repair_attempt_{attempt}.json", output)
+                )
         return output
 
     def _final_order_limit_issues(
